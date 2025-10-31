@@ -90,20 +90,18 @@ def save_known_pages(pages):
         json.dump(pages, f, indent=2, ensure_ascii=False)
 
 
-def send_to_slack(message: str):
+def send_to_slack(message):
     """Отправляет сообщение в Slack."""
+    import requests
     if not SLACK_WEBHOOK_URL:
-        print("⚠️ Slack webhook не задан — пропускаю отправку.")
+        print("⚠️ SLACK_WEBHOOK_URL не задан.")
         return
-    try:
-        requests.post(SLACK_WEBHOOK_URL, json={"text": message})
-    except Exception as e:
-        print(f"Ошибка при отправке в Slack: {e}")
+
+    payload = {"text": message}
+    requests.post(SLACK_WEBHOOK_URL, json=payload)
 
 
 def main():
-    print("🔍 Проверяю обновления в Notion...")
-
     known = load_known_pages()
     current = get_all_pages_recursively(ROOT_PAGE_ID)
 
@@ -111,16 +109,20 @@ def main():
     new_pages = [p for p in current if p["id"] not in known_ids]
 
     if new_pages:
-        message = "🆕 *New articles in Notion this week:*\n"
+        message_lines = ["🆕 *Найдены новые статьи:*", ""]
+
         for p in new_pages:
-            message += f"\n📘 *{p['title']}*\n🔗 {p['url']}\n✍️ {p['author']}\n"
-        print(message)
+            message_lines.append(
+                f":blue_book: *{p['title']}*\n"
+                f":link: {p['url']}\n"
+                f":writing_hand: {p['author']}\n"
+            )
+
+        message = "\n".join(message_lines)
         send_to_slack(message)
         save_known_pages(current)
     else:
-        print("✅ Новых статей нет.")
-        send_to_slack("✅ Новых статей в Notion нет.")
-
+        send_to_slack("✅ Новых статей нет.")
 
 if __name__ == "__main__":
     main()
