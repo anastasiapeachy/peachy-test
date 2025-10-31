@@ -2,6 +2,7 @@ from notion_client import Client
 import json
 import os
 import time
+import requests
 
 # === НАСТРОЙКИ ===
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
@@ -19,11 +20,11 @@ def notion_url(page_id: str) -> str:
 
 
 def get_page_info(page_id):
-    """Получает базовую информацию о странице (название, автор, ссылка)."""
+    """Получает информацию о странице (название, автор, ссылка)."""
     page = notion.pages.retrieve(page_id=page_id)
     title = None
 
-    # Пробуем получить заголовок из title-поля (если это страница базы данных)
+    # Пробуем извлечь заголовок
     if "properties" in page:
         for prop in page["properties"].values():
             if prop["type"] == "title" and prop["title"]:
@@ -31,18 +32,17 @@ def get_page_info(page_id):
                 break
 
     if not title:
-        title = page.get("object", "Неизвестная страница")
+        title = "Без названия"
 
+    # Получаем имя автора
     author_info = page.get("created_by", {})
-    author_name = author_info.get("name") or author_info.get("id", "Неизвестен")
-
-    # Если имя не найдено, попробуем запросить его отдельно
-    if author_name == author_info.get("id"):
+    author_name = "Неизвестен"
+    if author_info and "id" in author_info:
         try:
             user_data = notion.users.retrieve(user_id=author_info["id"])
-            author_name = user_data.get("name") or user_data.get("id")
+            author_name = user_data.get("name") or "Неизвестен"
         except Exception:
-            author_name = "Неизвестен"
+            pass
 
     return {
         "id": page_id,
@@ -53,7 +53,7 @@ def get_page_info(page_id):
 
 
 def get_all_pages_recursively(block_id):
-    """Рекурсивно получает все страницы в разделе."""
+    """Рекурсивно получает все страницы (включая вложенные)."""
     pages = []
     response = notion.blocks.children.list(block_id=block_id)
 
@@ -67,15 +67,13 @@ def get_all_pages_recursively(block_id):
                 except Exception:
                     info = {"id": page_id, "title": title, "author": "?", "url": notion_url(page_id)}
                 pages.append(info)
-                # Проверяем, есть ли вложенные страницы
+                # Проверяем вложенные страницы
                 pages.extend(get_all_pages_recursively(page_id))
 
         if not response.get("has_more"):
             break
-        response = notion.blocks.children.list(
-            block_id=block_id, start_cursor=response["next_cursor"]
-        )
-        time.sleep(0.2)
+        response = notion.blocks.children.list(block_id=block_id, start_cursor=response["next_cursor"])
+        time.sleep(0.3)
 
     return pages
 
@@ -92,7 +90,20 @@ def save_known_pages(pages):
         json.dump(pages, f, indent=2, ensure_ascii=False)
 
 
+def send_to_slack(message: str):
+    """Отправляет сообщение в Slack."""
+    if not SLACK_WEBHOOK_URL:
+        print("⚠️ Slack webhook не задан — пропускаю отправку.")
+        return
+    try:
+        requests.post(SLACK_WEBHOOK_URL, json={"text": message})
+    except Exception as e:
+        print(f"Ошибка при отправке в Slack: {e}")
+
+
 def main():
+    print("🔍 Проверяю обновления в Notion...")
+
     known = load_known_pages()
     current = get_all_pages_recursively(ROOT_PAGE_ID)
 
@@ -100,12 +111,15 @@ def main():
     new_pages = [p for p in current if p["id"] not in known_ids]
 
     if new_pages:
-        print("🆕 Найдены новые статьи:")
+        message = "🆕 *Найдены новые статьи в Notion:*\n"
         for p in new_pages:
-            print(f"\n📘 {p['title']}\n🔗 {p['url']}\n✍️ Автор: {p['author']}")
+            message += f"\n📘 *{p['title']}*\n🔗 {p['url']}\n✍️ {p['author']}"
+        print(message)
+        send_to_slack(message)
         save_known_pages(current)
     else:
         print("✅ Новых статей нет.")
+        send_to_slack("✅ Новых статей в Notion нет.")
 
 
 if __name__ == "__main__":
