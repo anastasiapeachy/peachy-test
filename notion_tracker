@@ -1,0 +1,111 @@
+from notion_client import Client
+import json
+import os
+import time
+
+# === НАСТРОЙКИ ===
+NOTION_TOKEN = "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"  # Твой integration token
+ROOT_PAGE_ID = "29cc28fa-d2d9-8080-be2f-e628b374a026"  # ID главной страницы или раздела
+STORAGE_FILE = "known_pages.json"
+
+notion = Client(auth=NOTION_TOKEN)
+
+
+def notion_url(page_id: str) -> str:
+    """Генерирует ссылку на страницу."""
+    clean_id = page_id.replace("-", "")
+    return f"https://www.notion.so/{clean_id}"
+
+
+def get_page_info(page_id):
+    """Получает базовую информацию о странице (название, автор, ссылка)."""
+    page = notion.pages.retrieve(page_id=page_id)
+    title = None
+
+    # Пробуем получить заголовок из title-поля (если это страница базы данных)
+    if "properties" in page:
+        for prop in page["properties"].values():
+            if prop["type"] == "title" and prop["title"]:
+                title = prop["title"][0]["plain_text"]
+                break
+
+    if not title:
+        title = page.get("object", "Неизвестная страница")
+
+    author_info = page.get("created_by", {})
+    author_name = author_info.get("name") or author_info.get("id", "Неизвестен")
+
+    # Если имя не найдено, попробуем запросить его отдельно
+    if author_name == author_info.get("id"):
+        try:
+            user_data = notion.users.retrieve(user_id=author_info["id"])
+            author_name = user_data.get("name") or user_data.get("id")
+        except Exception:
+            author_name = "Неизвестен"
+
+    return {
+        "id": page_id,
+        "title": title,
+        "author": author_name,
+        "url": notion_url(page_id),
+    }
+
+
+def get_all_pages_recursively(block_id):
+    """Рекурсивно получает все страницы в разделе."""
+    pages = []
+    response = notion.blocks.children.list(block_id=block_id)
+
+    while True:
+        for block in response["results"]:
+            if block["type"] == "child_page":
+                page_id = block["id"]
+                title = block["child_page"]["title"]
+                try:
+                    info = get_page_info(page_id)
+                except Exception:
+                    info = {"id": page_id, "title": title, "author": "?", "url": notion_url(page_id)}
+                pages.append(info)
+                # Проверяем, есть ли вложенные страницы
+                pages.extend(get_all_pages_recursively(page_id))
+
+        if not response.get("has_more"):
+            break
+        response = notion.blocks.children.list(
+            block_id=block_id, start_cursor=response["next_cursor"]
+        )
+        time.sleep(0.2)
+
+    return pages
+
+
+def load_known_pages():
+    if os.path.exists(STORAGE_FILE):
+        with open(STORAGE_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+
+def save_known_pages(pages):
+    with open(STORAGE_FILE, "w") as f:
+        json.dump(pages, f, indent=2, ensure_ascii=False)
+
+
+def main():
+    known = load_known_pages()
+    current = get_all_pages_recursively(ROOT_PAGE_ID)
+
+    known_ids = {p["id"] for p in known}
+    new_pages = [p for p in current if p["id"] not in known_ids]
+
+    if new_pages:
+        print("🆕 Найдены новые статьи:")
+        for p in new_pages:
+            print(f"\n📘 {p['title']}\n🔗 {p['url']}\n✍️ Автор: {p['author']}")
+        save_known_pages(current)
+    else:
+        print("✅ Новых статей нет.")
+
+
+if __name__ == "__main__":
+    main()
