@@ -111,9 +111,9 @@ def main():
     new_pages = [p for p in current if p["id"] not in known_ids]
 
     if new_pages:
-        message = "🆕 *Найдены новые статьи в Notion:*\n"
+        message = "🆕 *New articles in Notion this week:*\n"
         for p in new_pages:
-            message += f"\n📘 *{p['title']}*\n🔗 {p['url']}\n✍️ {p['author']}"
+            message += f"\n📘 *{p['title']}*\n🔗 {p['url']}\n✍️ {p['author']}\n"
         print(message)
         send_to_slack(message)
         save_known_pages(current)
