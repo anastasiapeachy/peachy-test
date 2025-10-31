@@ -3,7 +3,7 @@ name: Daily Notion Tracker
 on:
   schedule:
     - cron: "0 9 * * *" # запуск каждый день в 09:00 UTC
-  workflow_dispatch: # позволяет запустить вручную
+  workflow_dispatch: # можно запустить вручную
 
 jobs:
   check:
@@ -21,7 +21,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Загружаем сохранённый список старых страниц (если он есть)
       - name: Restore previous state
         uses: actions/download-artifact@v4
         continue-on-error: true
@@ -29,7 +28,6 @@ jobs:
           name: known-pages
           path: .
 
-      # Запускаем сам трекер
       - name: Run Notion tracker
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -37,7 +35,6 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: python notion_tracker/notion_tracker_slack.py
 
-      # Сохраняем актуальное состояние
       - name: Save new state
         if: always()
         uses: actions/upload-artifact@v4
