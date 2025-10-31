@@ -4,8 +4,9 @@ import os
 import time
 
 # === НАСТРОЙКИ ===
-NOTION_TOKEN = "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"  # Твой integration token
-ROOT_PAGE_ID = "29cc28fa-d2d9-8080-be2f-e628b374a026"  # ID главной страницы или раздела
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 STORAGE_FILE = "known_pages.json"
 
 notion = Client(auth=NOTION_TOKEN)
