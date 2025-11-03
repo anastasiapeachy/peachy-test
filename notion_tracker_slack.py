@@ -113,7 +113,7 @@ def main():
     new_pages = [p for p in current if p["id"] not in known_ids]
 
     if new_pages:
-        message_lines = ["🆕 *New articles in notion:*", ""]
+        message_lines = ["*New articles in Notion:*", ""]
         for p in new_pages:
             message_lines.append(
                 f":blue_book: *{p['title']}*\n"
