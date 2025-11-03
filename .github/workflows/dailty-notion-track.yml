@@ -26,14 +26,14 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt  # ✅ исправлено
+        run: pip install -r requirements.txt 
 
       - name: Run Notion Tracker
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: python notion_tracker/main.py  # ✅ исправлено
+        run: python notion_tracker_slack.py 
 
       - name: Save updated known pages cache
         if: always()
