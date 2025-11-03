@@ -113,12 +113,12 @@ def main():
     new_pages = [p for p in current if p["id"] not in known_ids]
 
     if new_pages:
-        message_lines = ["🆕 *Найдены новые статьи:*", ""]
+        message_lines = ["🆕 *New articles in notion:*", ""]
         for p in new_pages:
             message_lines.append(
                 f":blue_book: *{p['title']}*\n"
                 f":link: {p['url']}\n"
-                f":writing_hand: {p['author']}\n"
+                f":writing_hand: {p['author']}\n\n"
             )
         message = "\n".join(message_lines)
         send_to_slack(message)
