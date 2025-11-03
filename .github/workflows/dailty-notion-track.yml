@@ -2,22 +2,23 @@ name: Notion Tracker
 
 on:
   schedule:
-    - cron: "0 8 * * *"  # запускается каждый день в 08:00 UTC
-  workflow_dispatch:      # можно запустить вручную
+    - cron: "0 8 * * *"  # каждый день в 08:00 UTC
+  workflow_dispatch:      # запуск вручную
 
 jobs:
   track:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Restore known_pages.json cache
+      - name: Restore cache for known pages
+        id: cache-known-pages
         uses: actions/cache@v4
         with:
           path: notion-tracker/known_pages.json
-          key: notion-tracker-cache
+          key: known-pages-cache
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,8 +35,9 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: python notion-tracker/main.py
 
-      - name: Save updated known_pages.json
-        uses: actions/cache@v4
+      - name: Save updated known pages cache
+        if: always()
+        uses: actions/cache/save@v4
         with:
           path: notion-tracker/known_pages.json
-          key: notion-tracker-cache
+          key: known-pages-cache
