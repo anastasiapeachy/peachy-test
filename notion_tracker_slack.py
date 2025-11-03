@@ -14,7 +14,7 @@ notion = Client(auth=NOTION_TOKEN)
 
 
 def notion_url(page_id: str) -> str:
-    ""Generate page URL."""
+    """Generate page URL."""
     clean_id = page_id.replace("-", "")
     return f"https://www.notion.so/{clean_id}"
 
@@ -42,7 +42,7 @@ def get_page_info(page_id):
         try:
             user_data = notion.users.retrieve(user_id=author_info["id"])
             author_name = user_data.get("name") or user_data.get("id")
-        except Exception:
+        except Exception as e:
             print(f"Can't get author's name {page_id}: {e}")
             author_name = "Unknown"
 
@@ -85,8 +85,8 @@ def load_known_pages():
     os.makedirs(os.path.dirname(STORAGE_FILE), exist_ok=True)
     if os.path.exists(STORAGE_FILE):
         with open(STORAGE_FILE, "r") as f:
-            return json.load(f)
             print(f"{len(data)} known pages are loaded.")
+            return data
     return []
 
 
