@@ -3,7 +3,7 @@ name: Notion Tracker
 on:
   schedule:
     - cron: "0 8 * * *"  # каждый день в 08:00 UTC
-  workflow_dispatch:      # запуск вручную
+  workflow_dispatch:
 
 jobs:
   track:
@@ -17,7 +17,7 @@ jobs:
         id: cache-known-pages
         uses: actions/cache@v4
         with:
-          path: notion-tracker/known_pages.json
+          path: notion_tracker/known_pages.json
           key: known-pages-cache
 
       - name: Set up Python
@@ -26,18 +26,18 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r notion-tracker/requirements.txt
+        run: pip install -r requirements.txt  # ✅ исправлено
 
       - name: Run Notion Tracker
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: python notion-tracker/main.py
+        run: python notion_tracker/main.py  # ✅ исправлено
 
       - name: Save updated known pages cache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: notion-tracker/known_pages.json
+          path: notion_tracker/known_pages.json
           key: known-pages-cache
