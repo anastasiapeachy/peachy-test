@@ -2,23 +2,16 @@ name: Notion Tracker
 
 on:
   schedule:
-    - cron: "0 8 * * *"  # каждый день в 08:00 UTC
+    - cron: "0 9 * * *" # каждый день в 9 утра по UTC
   workflow_dispatch:
 
 jobs:
-  track:
+  check:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
-
-      - name: Restore cache for known pages
-        id: cache-known-pages
-        uses: actions/cache@v4
-        with:
-          path: notion_tracker/known_pages.json
-          key: known-pages-cache
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,18 +19,31 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt 
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore known pages cache
+        id: cache-known
+        uses: actions/cache@v4
+        with:
+          path: notion_tracker_data/known_pages.json
+          key: known-pages-${{ github.ref }}
+          restore-keys: |
+            known-pages-
 
       - name: Run Notion Tracker
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: python notion_tracker_slack.py 
+        run: |
+          mkdir -p notion_tracker_data
+          python notion_tracker_slack.py
 
-      - name: Save updated known pages cache
+      - name: Save updated known pages
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: notion_tracker/known_pages.json
-          key: known-pages-cache
+          path: notion_tracker_data/known_pages.json
+          key: known-pages-${{ github.ref }}
