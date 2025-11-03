@@ -85,8 +85,9 @@ def load_known_pages():
     os.makedirs(os.path.dirname(STORAGE_FILE), exist_ok=True)
     if os.path.exists(STORAGE_FILE):
         with open(STORAGE_FILE, "r") as f:
-            print(f"{len(data)} known pages are loaded.")
-            return data
+            data = json.load(f)
+        print(f"{len(data)} known pages are loaded.")  
+        return data
     return []
 
 
