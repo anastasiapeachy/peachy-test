@@ -1,7 +1,7 @@
 name: New Notion Articles Tracker
 
 on:
-  schedue: # write correctly when necessary
+  schedule: 
     - cron: "0 9 * * *" # every day at 9am UTC
   workflow_dispatch:
 
