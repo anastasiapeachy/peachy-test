@@ -140,7 +140,7 @@ def main():
 
     # === фильтруем ===
     now = datetime.now(timezone.utc)
-    week_ago = now - timedelta(days=7)
+    week_ago = now - timedelta(days=1)
     eligible_pages = []
 
     for p in new_pages:
@@ -155,7 +155,7 @@ def main():
 
     # === отправляем только новые и подходящие ===
     if eligible_pages:
-        message_lines = ["*🆕 New public articles (older than 7 days):*", ""]
+        message_lines = ["*🆕 New articles in Notion:*", ""]
         for p in eligible_pages:
             message_lines.append(
                 f":blue_book: *{p['title']}*\n"
