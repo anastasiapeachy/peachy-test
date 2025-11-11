@@ -1,7 +1,7 @@
 name: New Notion Articles Tracker
 
 on:
-  schedule: 
+  schedule:
     - cron: "0 9 * * *" # every day at 9am UTC
   workflow_dispatch:
 
@@ -23,9 +23,8 @@ jobs:
           echo "Starting Notion Tracker script..."
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          echo "Notion Tracker run completed."
 
-      - name: Restore and update known pages cache
+      - name: Restore known pages cache
         id: cache-known
         uses: actions/cache@v4
         with:
@@ -43,9 +42,9 @@ jobs:
           mkdir -p notion_tracker_data
           python notion_tracker_slack.py
 
-      - name: Save known pages and update cache
+      - name: Save known pages cache
         if: always()
-        uses: actions/cache@v4
+        uses: actions/cache/save@v4
         with:
-         path: notion_tracker_data/known_pages.json
-         key: known-pages-cache
+          path: notion_tracker_data/known_pages.json
+          key: known-pages-cache
