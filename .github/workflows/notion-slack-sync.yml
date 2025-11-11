@@ -16,28 +16,27 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
       
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version: '20'
+          python-version: '3.11'
       
       - name: Install dependencies
         run: |
-          npm install @notionhq/client@^2.2.0
-          npm install @slack/web-api@^6.9.0
+          pip install notion-client requests
       
       - name: Run sync script
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_ROOT_PAGE_ID: ${{ secrets.NOTION_ROOT_PAGE_ID }}
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
-        run: node .github/scripts/notion-slack-sync.js
+          ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python .github/scripts/notion_slack_sync.py
       
       - name: Commit cache updates
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git add .github/cache/posted-pages.json || true
+          git add .github/cache/posted_pages.json || true
           git diff --staged --quiet || git commit -m "Update posted pages cache [skip ci]"
           git push || true
