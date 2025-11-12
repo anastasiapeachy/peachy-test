@@ -1,7 +1,7 @@
 name: Notion Language Report
 
 on:
-  workflow_dispatch:  # запуск вручную через кнопку "Run workflow"
+  workflow_dispatch:  # запуск вручную
 
 jobs:
   notion-language-analysis:
@@ -19,7 +19,7 @@ jobs:
       - name: 📦 Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install notion-client langdetect
 
       - name: 🧠 Run Notion language analysis
         env:
