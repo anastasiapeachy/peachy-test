@@ -32,6 +32,11 @@ def get_page_title(page_id):
         pass
     return "(Без названия)"
 
+def get_page_url(page_id):
+    """Формируем ссылку на страницу в Notion"""
+    clean_id = page_id.replace("-", "")
+    return f"https://www.notion.so/{clean_id}"
+
 def get_page_blocks(page_id):
     """Получаем все блоки страницы"""
     blocks = []
@@ -64,10 +69,10 @@ def count_words(text):
     """Подсчет количества слов"""
     return len(re.findall(r'\b\w+\b', text))
 
-def process_page(page_id, results, path=""):
+def process_page(page_id, results):
     """Обработка страницы и подстраниц"""
     title = get_page_title(page_id)
-    full_path = f"{path}/{title}" if path else title
+    url = get_page_url(page_id)
     blocks = get_page_blocks(page_id)
 
     ru_words = 0
@@ -86,15 +91,15 @@ def process_page(page_id, results, path=""):
         # Обрабатываем подстраницы рекурсивно
         if block["type"] == "child_page":
             subpage_id = block["id"]
-            process_page(subpage_id, results, full_path)
+            process_page(subpage_id, results)
 
     total = ru_words + en_words
     ru_percent = (ru_words / total * 100) if total else 0
     en_percent = (en_words / total * 100) if total else 0
 
     results.append({
-        "Page Path": full_path,
-        "Page ID": page_id,
+        "Page Title": title,
+        "Page URL": url,
         "% Russian": round(ru_percent, 2),
         "% English": round(en_percent, 2)
     })
@@ -102,7 +107,7 @@ def process_page(page_id, results, path=""):
 def export_to_csv(results, filename="notion_language_percentages.csv"):
     """Сохраняем результаты в CSV"""
     with open(filename, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["Page Path", "Page ID", "% Russian", "% English"])
+        writer = csv.DictWriter(f, fieldnames=["Page Title", "Page URL", "% Russian", "% English"])
         writer.writeheader()
         writer.writerows(results)
     print(f"✅ CSV сохранён: {filename}")
