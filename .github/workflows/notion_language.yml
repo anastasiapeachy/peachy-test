@@ -1,0 +1,35 @@
+name: Notion Language Report
+
+on:
+  workflow_dispatch:  # запуск вручную через кнопку "Run workflow"
+
+jobs:
+  notion-language-analysis:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🧩 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: 🧠 Run Notion language analysis
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+        run: |
+          python notion_language_check.py
+
+      - name: 📁 Upload CSV report
+        uses: actions/upload-artifact@v4
+        with:
+          name: notion-language-report
+          path: notion_language_percentages.csv
