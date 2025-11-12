@@ -146,7 +146,7 @@ def main():
         return
     
     # Filter: public and older than 7 days
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=7)
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=1)
     eligible = []
     
     for page in new_pages:
@@ -167,7 +167,7 @@ def main():
         for page in eligible:
             known_pages.append(page)
     else:
-        print("No eligible pages (must be public and >7 days old)")
+        print("No eligible pages (must be public and >1 days old)")
     
     # Only save pages we've actually posted
     save_known_pages(known_pages)
