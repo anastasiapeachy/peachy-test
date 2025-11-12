@@ -1,35 +1,44 @@
-name: Notion Language Report
+name: Notion Articles Tracker
 
 on:
-  workflow_dispatch:  # запуск вручную
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
 
 jobs:
-  notion-language-analysis:
+  check:
     runs-on: ubuntu-latest
-
+    
     steps:
-      - name: 🧩 Checkout repository
-        uses: actions/checkout@v4
-
-      - name: 🐍 Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
-      - name: 📦 Install dependencies
+          python-version: "3.11"
+      
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install notion-client langdetect
-
-      - name: 🧠 Run Notion language analysis
+          pip install notion-client requests
+      
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: notion_tracker_data/known_pages.json
+          key: known-pages-${{ github.run_id }}
+          restore-keys: known-pages-
+      
+      - name: Run tracker
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          python notion_language_check.py
-
-      - name: 📁 Upload CSV report
-        uses: actions/upload-artifact@v4
+          mkdir -p notion_tracker_data
+          python notion_tracker_slack.py
+      
+      - name: Save cache
+        if: always()
+        uses: actions/cache/save@v4
         with:
-          name: notion-language-report
-          path: notion_language_percentages.csv
+          path: notion_tracker_data/known_pages.json
+          key: known-pages-${{ github.run_id }}
