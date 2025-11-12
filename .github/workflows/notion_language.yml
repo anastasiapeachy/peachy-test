@@ -23,8 +23,8 @@ jobs:
 
       - name: 🧠 Run Notion language analysis
         env:
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+         SLACK_WEBHOOK_URL: ${{ secrets.ROOT_PAGE_ID }}
         run: |
           python notion_language_check.py
 
