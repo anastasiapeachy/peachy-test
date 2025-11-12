@@ -146,7 +146,7 @@ def main():
         return
     
     # Filter: public and older than 7 days
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=1)
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=7)
     eligible = []
     
     for page in new_pages:
@@ -163,10 +163,14 @@ def main():
     if eligible:
         print(f"Found {len(eligible)} pages to post")
         send_to_slack(eligible)
+        # Add posted pages to known list
+        for page in eligible:
+            known_pages.append(page)
     else:
         print("No eligible pages (must be public and >7 days old)")
     
-    save_known_pages(current_pages)
+    # Only save pages we've actually posted
+    save_known_pages(known_pages)
 
 
 if __name__ == "__main__":
