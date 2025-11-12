@@ -1,3 +1,9 @@
+"""
+Скрипт анализирует все страницы и подстраницы в Notion
+и создает CSV-файл с процентом текста на русском и английском языках.
+Выводятся только: название страницы, ссылка на неё и проценты.
+"""
+
 import os
 import csv
 import re
@@ -12,25 +18,31 @@ if not os.path.exists("requirements.txt"):
 
 # --- основные настройки ---
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
+ROOT_PAGE_ID = os.getenv("SLACK_WEBHOOK_URL")  # ⚠️ используем Slack переменную вместо ROOT_PAGE_ID
 
 if not NOTION_TOKEN or not ROOT_PAGE_ID:
-    raise ValueError("❌ Не заданы переменные окружения NOTION_TOKEN или ROOT_PAGE_ID")
+    raise ValueError("❌ Не заданы переменные окружения NOTION_TOKEN или SLACK_WEBHOOK_URL")
 
 notion = Client(auth=NOTION_TOKEN)
 
 # --- функции ---
-def get_page_title(page_id):
-    """Получаем заголовок страницы"""
+def get_page_title(page_id, fallback_name="(Без названия)"):
+    """Получаем корректный заголовок страницы"""
     try:
         page = notion.pages.retrieve(page_id=page_id)
         props = page.get("properties", {})
         for prop in props.values():
             if prop.get("type") == "title":
-                return "".join([t["plain_text"] for t in prop[prop["type"]]["title"]])
+                title_parts = [t["plain_text"] for t in prop["title"]]
+                if title_parts:
+                    return "".join(title_parts)
+        # если нет в properties, возможно это child_page
+        block = notion.blocks.retrieve(block_id=page_id)
+        if block.get("type") == "child_page":
+            return block["child_page"].get("title", fallback_name)
     except Exception:
         pass
-    return "(Без названия)"
+    return fallback_name
 
 def get_page_url(page_id):
     """Формируем ссылку на страницу в Notion"""
