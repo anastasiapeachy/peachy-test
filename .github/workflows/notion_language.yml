@@ -1,7 +1,7 @@
 name: Notion Language Report
 
 on:
-  workflow_dispatch:  # запуск вручную
+  workflow_dispatch:  # запуск вручную через кнопку "Run workflow"
 
 jobs:
   notion-language-analysis:
@@ -23,8 +23,8 @@ jobs:
 
       - name: 🧠 Run Notion language analysis
         env:
-         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-         SLACK_WEBHOOK_URL: ${{ secrets.ROOT_PAGE_ID }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }} # используем эту переменную как ID стартовой страницы
         run: |
           python notion_language_check.py
 
