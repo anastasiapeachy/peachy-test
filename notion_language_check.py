@@ -235,7 +235,7 @@ def main():
     print(f"Pages that are descendants of root ({ROOT_PAGE_ID}): {len(selected_pages)}")
 
     results = []
-    for p in selected_pages:
+ for p in selected_pages:
         pid = normalize_id(p.get("id"))
         title = get_page_title_from_obj(p)
         url = get_page_url(pid)
@@ -249,6 +249,9 @@ def main():
             "% Russian": round(ru_percent, 2),
             "% English": round(en_percent, 2)
         })
+
+    # 🔽 сортируем: от страниц с 100% английского к 0%
+    results.sort(key=lambda x: x["% English"], reverse=True)
 
     # write csv
     fname = "notion_language_percentages.csv"
