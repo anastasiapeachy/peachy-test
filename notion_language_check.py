@@ -241,23 +241,22 @@ def main():
         title = get_page_title_from_obj(p)
         url = get_page_url(pid)
 
-        # --- автор: тот, кто создал страницу ---
-        author = "(не указан)"
+        # --- получаем автора страницы ---
+        author_name = "(не указан)"
         try:
-            created_by = p.get("created_by") or {}
-            if created_by:
-                author = created_by.get("name") or "(без имени)"
-            else:
-                # резервный способ через properties.created_by
-                props = p.get("properties", {}) or {}
-                for prop in props.values():
-                    if prop.get("type") == "created_by":
-                        user = prop.get("created_by", {})
-                        if user:
-                            author = user.get("name", "(без имени)")
-                        break
+            author_info = p.get("created_by", {})
+            author_name = author_info.get("name", "Unknown")
+
+            if not author_name or author_name == "Unknown":
+                user_id = author_info.get("id")
+                if user_id:
+                    try:
+                        user_data = notion.users.retrieve(user_id=user_id)
+                        author_name = user_data.get("name", "Unknown")
+                    except Exception:
+                        author_name = "Unknown"
         except Exception:
-            pass
+            author_name = "Unknown"
 
         # --- анализ текста страницы ---
         ru_words, en_words = analyze_page_text(pid)
@@ -268,7 +267,7 @@ def main():
         results.append({
             "Page Title": title,
             "Page URL": url,
-            "Author": author,
+            "Author": author_name,
             "% Russian": round(ru_percent, 2),
             "% English": round(en_percent, 2)
         })
