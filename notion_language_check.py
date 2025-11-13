@@ -240,13 +240,38 @@ def main():
         pid = normalize_id(p.get("id"))
         title = get_page_title_from_obj(p)
         url = get_page_url(pid)
+
+        # --- определяем автора ---
+        author = "(не указан)"
+        props = p.get("properties", {}) or {}
+        for prop in props.values():
+            ptype = prop.get("type")
+            if ptype == "people":
+                people = prop.get("people", [])
+                if people:
+                    author = ", ".join([u.get("name", "(без имени)") for u in people])
+                    break
+            elif ptype == "rich_text":
+                txt = "".join([t.get("plain_text", "") for t in prop.get("rich_text", [])])
+                if txt.strip():
+                    author = txt.strip()
+                    break
+            elif ptype == "created_by":
+                user = prop.get("created_by")
+                if user:
+                    author = user.get("name", "(без имени)")
+                    break
+
+        # --- анализ текста страницы ---
         ru_words, en_words = analyze_page_text(pid)
         total = ru_words + en_words
         ru_percent = (ru_words / total * 100) if total else 0
         en_percent = (en_words / total * 100) if total else 0
+
         results.append({
             "Page Title": title,
             "Page URL": url,
+            "Author": author,
             "% Russian": round(ru_percent, 2),
             "% English": round(en_percent, 2)
         })
@@ -257,7 +282,10 @@ def main():
     # --- запись в CSV ---
     fname = "notion_language_percentages.csv"
     with open(fname, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["Page Title", "Page URL", "% Russian", "% English"])
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["Page Title", "Page URL", "Author", "% Russian", "% English"]
+        )
         writer.writeheader()
         writer.writerows(results)
 
