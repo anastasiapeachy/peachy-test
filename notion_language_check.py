@@ -282,6 +282,12 @@ def main():
         writer = csv.DictWriter(
             f,
             fieldnames=["Page Title", "Page URL", "Author", "% Russian", "% English"]
+        )
+        writer.writeheader()
+        writer.writerows(results)
+
+    print(f"Saved {len(results)} rows to {fname}")
+    print(f"Elapsed: {time.time() - start:.1f}s")
 
 if __name__ == "__main__":
     main()
