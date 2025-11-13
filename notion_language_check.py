@@ -102,6 +102,37 @@ def extract_text(block):
         return "".join([t.get("plain_text", "") for t in rich]).strip()
     return ""
 
+def extract_all_text(blocks):
+    """Recursively extract text from blocks, including nested blocks and columns"""
+    texts = []
+    
+    for block in blocks:
+        block_type = block.get("type")
+        
+        # grab rich_text if available
+        if "rich_text" in block.get(block_type, {}):
+            for rt in block[block_type]["rich_text"]:
+                if rt.get("plain_text"):
+                    texts.append(rt["plain_text"])
+        
+        # handle nested blocks (toggles, callouts, etc)
+        if block.get("has_children"):
+            try:
+                children = notion.blocks.children.list(block_id=block["id"]).get("results", [])
+                texts.extend(extract_all_text(children))
+            except:
+                pass
+        
+        # handle columns specifically (common place to miss text)
+        if block_type in ("column_list", "column"):
+            try:
+                children = notion.blocks.children.list(block_id=block["id"]).get("results", [])
+                texts.extend(extract_all_text(children))
+            except:
+                pass
+    
+    return texts
+
 def detect_lang(text):
     try:
         return detect(text)
