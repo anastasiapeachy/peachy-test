@@ -5,98 +5,102 @@ import time
 from notion_client import Client
 from langdetect import detect
 
-# create requirements.txt if missing
-if not os.path.exists("requirements.txt"):
-    with open("requirements.txt", "w", encoding="utf-8") as req:
-        req.write("notion-client\nlangdetect\n")
-
+# grab env vars
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-ROOT_PAGE_ID = os.getenv("SLACK_WEBHOOK_URL")  # use this as root page id
+ROOT_PAGE_ID = os.getenv("SLACK_WEBHOOK_URL")  # yeah, reusing this var for page ID
 
 if not NOTION_TOKEN or not ROOT_PAGE_ID:
-    raise ValueError("NOTION_TOKEN or SLACK_WEBHOOK_URL (root page id) not set in env")
+    raise ValueError("Missing NOTION_TOKEN or SLACK_WEBHOOK_URL env vars")
 
-# normalize root id (remove hyphens if user passed dashed id or URL)
-def normalize_id(maybe_id):
-    if not isinstance(maybe_id, str):
-        return maybe_id
-    s = maybe_id.strip()
-    # if it's a full URL with an id at end, try to extract hex id
+# clean up page IDs - handle URLs, dashes, etc
+def normalize_id(raw_id):
+    if not isinstance(raw_id, str):
+        return raw_id
+    s = raw_id.strip()
+    # extract hex ID from URL if present
     match = re.search(r"([0-9a-fA-F]{32})", s.replace("-", ""))
     if match:
         return match.group(1)
-    # remove dashes
     return s.replace("-", "")
 
 ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
-
 notion = Client(auth=NOTION_TOKEN)
 
-# --- helpers ---
-def get_all_pages_via_search():
-    """Возвращает список page objects (полных), полученных через search (всех страниц workspace)."""
+def get_all_pages():
+    """Pull all pages from workspace using search"""
     pages = []
-    next_cursor = None
+    cursor = None
+    
     while True:
         try:
             resp = notion.search(
                 query="",
                 filter={"value": "page", "property": "object"},
-                start_cursor=next_cursor
+                start_cursor=cursor
             )
         except Exception as e:
-            print(f"Search error: {e}")
+            print(f"Search failed: {e}")
             break
-        results = resp.get("results", [])
-        pages.extend(results)
+            
+        pages.extend(resp.get("results", []))
+        
         if not resp.get("has_more"):
             break
-        next_cursor = resp.get("next_cursor")
+        cursor = resp.get("next_cursor")
+        
     return pages
 
-def get_page_title_from_obj(page_obj):
-    props = page_obj.get("properties", {}) or {}
+def get_title(page):
+    """Extract page title, with fallback"""
+    props = page.get("properties", {}) or {}
+    
     for prop in props.values():
         if prop.get("type") == "title":
             parts = [t.get("plain_text", "") for t in prop.get("title", [])]
             if parts:
                 return "".join(parts)
-    # fallback: try to retrieve as block if possible
+    
+    # fallback - try block API
     try:
-        blk = notion.blocks.retrieve(block_id=page_obj["id"])
+        blk = notion.blocks.retrieve(block_id=page["id"])
         if blk.get("type") == "child_page":
-            return blk["child_page"].get("title", "(Без названия)")
-    except Exception:
+            return blk["child_page"].get("title", "(untitled)")
+    except:
         pass
-    return "(Без названия)"
+        
+    return "(untitled)"
 
-def get_page_url(page_id):
+def make_url(page_id):
     clean = page_id.replace("-", "")
     return f"https://www.notion.so/{clean}"
 
-def get_block_children(block_id):
-    """Получаем все дочерние блоки страницы (без падения при ошибке)."""
-    children = []
-    next_cursor = None
+def get_blocks(block_id):
+    """Fetch all child blocks"""
+    blocks = []
+    cursor = None
+    
     while True:
         try:
-            resp = notion.blocks.children.list(block_id=block_id, start_cursor=next_cursor)
+            resp = notion.blocks.children.list(block_id=block_id, start_cursor=cursor)
         except Exception as e:
-            print(f"⚠️ Cannot get blocks for {block_id}: {e}")
+            print(f"Can't get blocks for {block_id}: {e}")
             break
-        children.extend(resp.get("results", []))
+            
+        blocks.extend(resp.get("results", []))
+        
         if not resp.get("has_more"):
             break
-        next_cursor = resp.get("next_cursor")
-    return children
+        cursor = resp.get("next_cursor")
+        
+    return blocks
 
-def extract_text_from_block(block):
-    text = ""
+def extract_text(block):
+    """Pull text from a block"""
     btype = block.get("type")
     if btype and isinstance(block.get(btype), dict):
         rich = block[btype].get("rich_text", [])
-        text = "".join([t.get("plain_text", "") for t in rich])
-    return text.strip()
+        return "".join([t.get("plain_text", "") for t in rich]).strip()
+    return ""
 
 def detect_lang(text):
     try:
@@ -107,175 +111,191 @@ def detect_lang(text):
 def count_words(text):
     return len(re.findall(r'\b\w+\b', text))
 
-# --- core: check if page is descendant of root ---
-def is_descendant(page_obj, root_id, pages_index):
+def is_child_of_root(page, root_id, page_index):
     """
-    Проверяет, является ли страница потомком root_id.
-    Поднимаемся по parent chain. pages_index — dict id->page_obj (если есть).
-    Если parent.type == 'page_id' и parent.page_id == root_id -> True.
-    Иначе идём дальше вверх по родителям (через pages_index или API retrieve).
+    Walk up parent chain to see if this page descends from root.
+    Uses page_index dict for fast lookups, falls back to API if needed.
     """
     visited = set()
-    current = page_obj
+    current = page
+    
     while True:
         parent = current.get("parent", {}) or {}
         ptype = parent.get("type")
-        # handle direct page parent
+        
         if ptype == "page_id":
             pid = parent.get("page_id")
             if not pid:
                 return False
-            pid_norm = normalize_id(pid)
-            if pid_norm == root_id:
+                
+            pid_clean = normalize_id(pid)
+            
+            # found our root!
+            if pid_clean == root_id:
                 return True
-            if pid_norm in visited:
+                
+            # avoid loops
+            if pid_clean in visited:
                 return False
-            visited.add(pid_norm)
-            # try to get parent page object from index, otherwise retrieve
-            parent_obj = pages_index.get(pid_norm)
-            if not parent_obj:
+            visited.add(pid_clean)
+            
+            # try to get parent page
+            parent_page = page_index.get(pid_clean)
+            if not parent_page:
                 try:
-                    parent_obj = notion.pages.retrieve(page_id=pid_norm)
-                except Exception:
+                    parent_page = notion.pages.retrieve(page_id=pid_clean)
+                except:
                     return False
-            current = parent_obj
+                    
+            current = parent_page
             continue
-        # parent could be workspace -> stop
-        if ptype == "workspace":
+            
+        elif ptype == "workspace":
             return False
-        # parent could be database_id or block_id or something else -> in our case user said no databases,
-        # but if it's database, then its parent might lead up further; try to fetch database to find its parent
-        if ptype == "database_id":
+            
+        elif ptype == "database_id":
+            # sometimes pages live in databases - check db's parent
             db_id = parent.get("database_id")
             if not db_id:
                 return False
-            # try to retrieve database to inspect its parent (rare, but safe)
+                
             try:
                 db = notion.databases.retrieve(database_id=db_id)
                 db_parent = db.get("parent", {})
-                if db_parent.get("type") == "page_id" and normalize_id(db_parent.get("page_id")) == root_id:
-                    return True
-                # if db parent is a page, set current to that page and continue loop
+                
                 if db_parent.get("type") == "page_id":
-                    pid_norm = normalize_id(db_parent.get("page_id"))
-                    if pid_norm in visited:
+                    pid_clean = normalize_id(db_parent.get("page_id"))
+                    if pid_clean == root_id:
+                        return True
+                    if pid_clean in visited:
                         return False
-                    visited.add(pid_norm)
-                    parent_obj = pages_index.get(pid_norm) or notion.pages.retrieve(page_id=pid_norm)
-                    current = parent_obj
+                    visited.add(pid_clean)
+                    
+                    parent_page = page_index.get(pid_clean) or notion.pages.retrieve(page_id=pid_clean)
+                    current = parent_page
                     continue
+                    
                 return False
-            except Exception:
+            except:
                 return False
-        # other types (block_id etc.) — try to retrieve block and see its parent
-        if ptype == "block_id":
+                
+        elif ptype == "block_id":
+            # blocks can be parents too (rare but happens)
             bid = parent.get("block_id")
             if not bid:
                 return False
+                
             try:
                 blk = notion.blocks.retrieve(block_id=bid)
-                # block object has parent too; convert to page-like object for next iteration
                 blk_parent = blk.get("parent", {})
                 if not blk_parent:
                     return False
-                # construct a fake page_obj with parent to continue chain
                 current = {"id": bid, "parent": blk_parent}
                 continue
-            except Exception:
+            except:
                 return False
-        # unknown parent type — stop
-        return False
+        else:
+            return False
 
-# --- processing single page text ---
-def analyze_page_text(page_id):
-    """Собирает все текстовые блоки страницы (только этой страницы) и считает ru/en слова."""
+def analyze_page(page_id):
+    """Count Russian and English words on a single page"""
     ru = 0
     en = 0
-    blocks = get_block_children(page_id)
+    
+    blocks = get_blocks(page_id)
+    
     for block in blocks:
-        # skip child_page block content (subpage counted separately)
+        # skip child pages - they're counted separately
         if block.get("type") == "child_page":
             continue
-        txt = extract_text_from_block(block)
-        if not txt:
+            
+        text = extract_text(block)
+        if not text:
             continue
-        lang = detect_lang(txt)
-        words = count_words(txt)
+            
+        lang = detect_lang(text)
+        words = count_words(text)
+        
         if lang == "ru":
             ru += words
         elif lang == "en":
             en += words
+            
     return ru, en
 
-# --- main ---
 def main():
     start = time.time()
-    pages = get_all_pages_via_search()
-    print(f"Total pages discovered by search: {len(pages)}")
-
-    # index by normalized id for fast lookup
-    pages_index = {}
-    for p in pages:
-        pid_norm = normalize_id(p.get("id"))
-        pages_index[pid_norm] = p
-
-    selected_pages = []
+    
+    print("Fetching all pages...")
+    pages = get_all_pages()
+    print(f"Found {len(pages)} total pages")
+    
+    # build index for fast lookups
+    page_index = {}
     for p in pages:
         pid = normalize_id(p.get("id"))
+        page_index[pid] = p
+    
+    # filter to pages under our root
+    selected = []
+    for p in pages:
+        pid = normalize_id(p.get("id"))
+        
         # include root itself
         if pid == ROOT_PAGE_ID:
-            selected_pages.append(p)
+            selected.append(p)
             continue
+            
         try:
-            if is_descendant(p, ROOT_PAGE_ID, pages_index):
-                selected_pages.append(p)
+            if is_child_of_root(p, ROOT_PAGE_ID, page_index):
+                selected.append(p)
         except Exception as e:
-            print(f"Error checking ancestry for {pid}: {e}")
-
-    print(f"Pages that are descendants of root ({ROOT_PAGE_ID}): {len(selected_pages)}")
-
-    # --- анализ каждой страницы ---
+            print(f"Error checking {pid}: {e}")
+    
+    print(f"Found {len(selected)} pages under root")
+    
+    # analyze each page
     results = []
-    for p in selected_pages:
+    for p in selected:
         pid = normalize_id(p.get("id"))
-        title = get_page_title_from_obj(p)
-        url = get_page_url(pid)
-
-        # --- получаем автора страницы ---
-        author_name = "(не указан)"
+        title = get_title(p)
+        url = make_url(pid)
+        
+        # get author
+        author = "(unknown)"
         try:
             author_info = p.get("created_by", {})
-            author_name = author_info.get("name", "Unknown")
-
-            if not author_name or author_name == "Unknown":
+            author = author_info.get("name", "Unknown")
+            
+            if not author or author == "Unknown":
                 user_id = author_info.get("id")
                 if user_id:
                     try:
                         user_data = notion.users.retrieve(user_id=user_id)
-                        author_name = user_data.get("name", "Unknown")
-                    except Exception:
-                        author_name = "Unknown"
-        except Exception:
-            author_name = "Unknown"
-
-        # --- анализ текста страницы ---
-        ru_words, en_words = analyze_page_text(pid)
-        total = ru_words + en_words
-        ru_percent = (ru_words / total * 100) if total else 0
-        en_percent = (en_words / total * 100) if total else 0
-
+                        author = user_data.get("name", "Unknown")
+                    except:
+                        pass
+        except:
+            pass
+        
+        # analyze content
+        ru, en = analyze_page(pid)
+        total = ru + en
+        ru_pct = (ru / total * 100) if total else 0
+        en_pct = (en / total * 100) if total else 0
+        
         results.append({
             "Page Title": title,
             "Page URL": url,
-            "Author": author_name,
-            "% Russian": round(ru_percent, 2),
-            "% English": round(en_percent, 2)
+            "Author": author,
+            "% Russian": round(ru_pct, 2),
+            "% English": round(en_pct, 2)
         })
-
-    # 🔽 сортировка: от страниц с 100% английского к 0%
+    
+    # sort by English % (high to low)
     results.sort(key=lambda x: x["% English"], reverse=True)
-
-    # --- запись в CSV ---
+    
+    # write CSV
     fname = "notion_language_percentages.csv"
     with open(fname, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
@@ -284,9 +304,9 @@ def main():
         )
         writer.writeheader()
         writer.writerows(results)
-
-    print(f"Saved {len(results)} rows to {fname}")
-    print(f"Elapsed: {time.time() - start:.1f}s")
+    
+    print(f"\nSaved {len(results)} rows to {fname}")
+    print(f"Took {time.time() - start:.1f}s")
 
 if __name__ == "__main__":
     main()
