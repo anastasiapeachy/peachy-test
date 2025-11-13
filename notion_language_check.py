@@ -241,26 +241,23 @@ def main():
         title = get_page_title_from_obj(p)
         url = get_page_url(pid)
 
-        # --- определяем автора ---
+        # --- автор: тот, кто создал страницу ---
         author = "(не указан)"
-        props = p.get("properties", {}) or {}
-        for prop in props.values():
-            ptype = prop.get("type")
-            if ptype == "people":
-                people = prop.get("people", [])
-                if people:
-                    author = ", ".join([u.get("name", "(без имени)") for u in people])
-                    break
-            elif ptype == "rich_text":
-                txt = "".join([t.get("plain_text", "") for t in prop.get("rich_text", [])])
-                if txt.strip():
-                    author = txt.strip()
-                    break
-            elif ptype == "created_by":
-                user = prop.get("created_by")
-                if user:
-                    author = user.get("name", "(без имени)")
-                    break
+        try:
+            created_by = p.get("created_by") or {}
+            if created_by:
+                author = created_by.get("name") or "(без имени)"
+            else:
+                # резервный способ через properties.created_by
+                props = p.get("properties", {}) or {}
+                for prop in props.values():
+                    if prop.get("type") == "created_by":
+                        user = prop.get("created_by", {})
+                        if user:
+                            author = user.get("name", "(без имени)")
+                        break
+        except Exception:
+            pass
 
         # --- анализ текста страницы ---
         ru_words, en_words = analyze_page_text(pid)
@@ -285,12 +282,6 @@ def main():
         writer = csv.DictWriter(
             f,
             fieldnames=["Page Title", "Page URL", "Author", "% Russian", "% English"]
-        )
-        writer.writeheader()
-        writer.writerows(results)
-
-    print(f"Saved {len(results)} rows to {fname}")
-    print(f"Elapsed: {time.time() - start:.1f}s")
 
 if __name__ == "__main__":
     main()
