@@ -1,0 +1,36 @@
+name: Check Notion Stale Pages
+
+on:
+  # Run manually
+  workflow_dispatch:
+  
+  # Run automatically every Monday at 9 AM UTC
+  schedule:
+    - cron: '0 9 * * 1'
+
+jobs:
+  check-stale-pages:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Run stale pages checker
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+          MONTHS_THRESHOLD: 12
+        run: python stale_pages.py
+      
+      - name: Upload CSV report
+        uses: actions/upload-artifact@v4
+        with:
+          name: stale-pages-report
+          path: stale_notion_pages.csv
+          retention-days: 30
