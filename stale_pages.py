@@ -163,6 +163,8 @@ def find_stale_pages():
     # First test if we can access the root page
     if not test_root_page_access():
         print("\n⚠️  Cannot access root page. Please fix the issues above and try again.")
+        # Create empty CSV even on failure
+        create_empty_csv()
         return
     
     print(f"\n{'=' * 100}")
@@ -183,6 +185,8 @@ def find_stale_pages():
         print("1. The root page has no subpages")
         print("2. The subpages are not shared with your integration")
         print("3. You might need to connect the integration to child pages as well")
+        # Create empty CSV
+        create_empty_csv()
         return
     
     # Filter pages that haven't been edited in the threshold period
@@ -224,39 +228,91 @@ def find_stale_pages():
         print(f"   URL: {page['url']}")
         print("-" * 100)
     
-    # Export to CSV
+    # Always create CSV file
+    create_csv_report(stale_pages, len(all_pages))
+    
+    # Create summary for GitHub Actions
+    create_github_summary(stale_pages, len(all_pages))
+
+def create_empty_csv():
+    """Create an empty CSV file when no data is available"""
+    csv_filename = 'stale_notion_pages.csv'
+    with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ['Title', 'Author', 'Last Editor', 'Last Edited', 'Days Since Edit', 'URL']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+    print(f"\n✓ Empty CSV file created: {csv_filename}")
+
+def create_csv_report(stale_pages, total_pages):
+    """Create CSV report with results"""
     csv_filename = 'stale_notion_pages.csv'
     with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
         fieldnames = ['Title', 'Author', 'Last Editor', 'Last Edited', 'Days Since Edit', 'URL']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
         writer.writeheader()
-        for page in stale_pages:
+        
+        if stale_pages:
+            for page in stale_pages:
+                writer.writerow({
+                    'Title': page['title'],
+                    'Author': page['author'],
+                    'Last Editor': page['last_editor'],
+                    'Last Edited': page['last_edited_time'][:10],
+                    'Days Since Edit': page['days_since_edit'],
+                    'URL': page['url']
+                })
+        else:
+            # Add a note row if no stale pages found
             writer.writerow({
-                'Title': page['title'],
-                'Author': page['author'],
-                'Last Editor': page['last_editor'],
-                'Last Edited': page['last_edited_time'][:10],
-                'Days Since Edit': page['days_since_edit'],
-                'URL': page['url']
+                'Title': f'No stale pages found (scanned {total_pages} pages)',
+                'Author': '',
+                'Last Editor': '',
+                'Last Edited': '',
+                'Days Since Edit': '',
+                'URL': ''
             })
     
-    print(f"\nResults saved to {csv_filename}")
-    
-    # Create summary for GitHub Actions
-    if os.environ.get('GITHUB_STEP_SUMMARY'):
-        with open(os.environ.get('GITHUB_STEP_SUMMARY'), 'w') as f:
-            f.write(f"# Notion Stale Pages Report\n\n")
-            f.write(f"**Total Pages Scanned:** {len(all_pages)}\n\n")
-            f.write(f"**Stale Pages Found:** {len(stale_pages)}\n\n")
-            f.write(f"**Threshold:** Pages not edited in {MONTHS_THRESHOLD} months\n\n")
-            
-            if stale_pages:
-                f.write("## Top 10 Oldest Pages\n\n")
-                f.write("| Title | Last Edited | Days Ago | Author |\n")
-                f.write("|-------|-------------|----------|--------|\n")
-                for page in stale_pages[:10]:
-                    f.write(f"| [{page['title']}]({page['url']}) | {page['last_edited_time'][:10]} | {page['days_since_edit']} | {page['author']} |\n")
+    print(f"\n✓ CSV report created: {csv_filename}")
+    print(f"  Total pages scanned: {total_pages}")
+    print(f"  Stale pages found: {len(stale_pages)}")
+
+def create_github_summary(stale_pages, total_pages):
+    """Create GitHub Actions summary"""
+    if not os.environ.get('GITHUB_STEP_SUMMARY'):
+        return
+        
+    with open(os.environ.get('GITHUB_STEP_SUMMARY'), 'w') as f:
+        f.write(f"# Notion Stale Pages Report\n\n")
+        f.write(f"**Total Pages Scanned:** {total_pages}\n\n")
+        f.write(f"**Stale Pages Found:** {len(stale_pages)}\n\n")
+        f.write(f"**Threshold:** Pages not edited in {MONTHS_THRESHOLD} months\n\n")
+        
+        if stale_pages:
+            f.write("## Top 10 Oldest Pages\n\n")
+            f.write("| Title | Last Edited | Days Ago | Author |\n")
+            f.write("|-------|-------------|----------|--------|\n")
+            for page in stale_pages[:10]:
+                f.write(f"| [{page['title']}]({page['url']}) | {page['last_edited_time'][:10]} | {page['days_since_edit']} | {page['author']} |\n")
+        else:
+            f.write("## ✅ No Stale Pages Found\n\n")
+            f.write(f"All {total_pages} pages have been edited within the last {MONTHS_THRESHOLD} months.\n")
 
 if __name__ == "__main__":
-    find_stale_pages()
+    try:
+        find_stale_pages()
+    except Exception as e:
+        print(f"\n{'=' * 100}")
+        print(f"CRITICAL ERROR")
+        print(f"{'=' * 100}")
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Still create an empty CSV so the workflow doesn't fail
+        print(f"\n{'=' * 100}")
+        print("Creating empty CSV file due to error...")
+        create_empty_csv()
+        
+        # Exit with error code
+        sys.exit(1)
