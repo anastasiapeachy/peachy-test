@@ -1,4 +1,4 @@
-name: Check Old Notion pages
+name: Check old Notion pages
 
 on:
   workflow_dispatch:
@@ -10,18 +10,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Debug — list files
+        run: |
+          pwd
+          ls -R .
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install requirements
-        run: |
-          pip install notion-client==2.2.1
+        run: pip install notion-client==2.2.1
 
-      - name: Run check
+      - name: Run script
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
-        run: |
-          notion_old_pages.py
+        run: python notion_old_pages.py
