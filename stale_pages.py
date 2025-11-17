@@ -23,12 +23,12 @@ from notion_client import Client
 import csv
 
 # Configuration from environment variables
-NOTION_API_KEY = os.environ.get('NOTION_API_KEY')
+NOTION_TOKEN = os.environ.get('NOTION_TOKEN')
 ROOT_PAGE_ID = os.environ.get('ROOT_PAGE_ID')
 MONTHS_THRESHOLD = int(os.environ.get('MONTHS_THRESHOLD', '12'))
 
 # Initialize Notion client
-notion = Client(auth=NOTION_API_KEY)
+notion = Client(auth=NOTION_TOKEN)
 
 # Calculate date threshold
 threshold_date = datetime.now() - timedelta(days=MONTHS_THRESHOLD * 30)
