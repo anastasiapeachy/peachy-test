@@ -7,7 +7,6 @@ from notion_client.errors import APIResponseError
 # ----------------------------
 # Environment
 # ----------------------------
-
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
 
@@ -17,7 +16,6 @@ if not NOTION_TOKEN or not ROOT_PAGE_ID:
 notion = Client(auth=NOTION_TOKEN)
 
 ONE_YEAR_AGO = datetime.utcnow() - timedelta(days=365)
-
 
 # ----------------------------
 # Utilities
@@ -30,19 +28,18 @@ def normalize_id(raw_id: str) -> str:
         raw_id = raw_id.split("/")[-1]
     return raw_id.replace("-", "")
 
-
 ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
-
 
 def safe_request(func, *args, **kwargs):
     """
-    Safely call the Notion API with:
-    - automatic retry on 429 (rate limit)
-    - small delay before every request
-    - max retry protection
+    Safely call Notion API with:
+    - retry on 429 (rate limit)
+    - retry on 5xx errors (Notion internal API failures)
+    - exponential backoff
     """
     max_retries = 10
-    base_delay = 0.35  # Notion allows ~3 requests/sec
+    base_delay = 0.35
+    backoff = 1
 
     for attempt in range(max_retries):
         try:
@@ -50,15 +47,26 @@ def safe_request(func, *args, **kwargs):
             return func(*args, **kwargs)
 
         except APIResponseError as e:
-            if e.status == 429:
+            status = e.status
+
+            # 429 - rate limit
+            if status == 429:
                 retry_after = int(getattr(e, "headers", {}).get("Retry-After", 1))
-                print(f"[RATE LIMIT] Waiting {retry_after}s...")
+                print(f"[429] Rate limit exceeded. Waiting {retry_after}s...")
                 time.sleep(retry_after)
-            else:
-                raise
+                continue
 
-    raise RuntimeError("Too many retry attempts after hitting rate limits.")
+            # 5xx - Notion internal failure
+            if 500 <= status <= 599:
+                print(f"[{status}] Notion API internal error. Retrying in {backoff}s...")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)  # exponential backoff
+                continue
 
+            # Other errors — not recoverable
+            raise
+
+    raise RuntimeError("Too many retries — Notion API not responding.")
 
 # ----------------------------
 # Page scanning
@@ -75,15 +83,12 @@ def get_block_children(page_id):
             block_id=page_id,
             start_cursor=next_cursor
         )
-
         blocks.extend(response.get("results", []))
         next_cursor = response.get("next_cursor")
-
         if not next_cursor:
             break
 
     return blocks
-
 
 def get_page_info(page):
     """Extract title, author and last edited time from a page."""
@@ -109,7 +114,6 @@ def get_page_info(page):
 
     return title, author, last_edited
 
-
 def fetch_all_pages_recursively(page_id, collected):
     """Recursively explore all child pages."""
     children = get_block_children(page_id)
@@ -121,14 +125,12 @@ def fetch_all_pages_recursively(page_id, collected):
         if block_type == "child_page":
             page = safe_request(notion.pages.retrieve, block["id"])
             collected.append(page)
-
             # Recurse into this page
             fetch_all_pages_recursively(block["id"], collected)
 
         # Some block types (e.g. toggles, synced blocks) can have nested children
         if block.get("has_children"):
             fetch_all_pages_recursively(block["id"], collected)
-
 
 # ----------------------------
 # Main
@@ -155,6 +157,9 @@ def main():
                 "url": f"https://notion.so/{page['id'].replace('-', '')}"
             })
 
+        # Optional: small delay to reduce API pressure
+        time.sleep(0.05)
+
     print("\n================ OLD PAGES (>1 year) ================\n")
 
     if not old_pages:
@@ -169,7 +174,6 @@ def main():
 
     # OPTIONAL: fail job if any pages are old
     # raise SystemExit("Old pages found — review required.")
-
 
 if __name__ == "__main__":
     main()
