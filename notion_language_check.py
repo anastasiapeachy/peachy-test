@@ -12,7 +12,6 @@ ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")  # now correct
 if not NOTION_TOKEN or not ROOT_PAGE_ID:
     raise ValueError("Missing NOTION_TOKEN or ROOT_PAGE_ID env vars")
 
-# clean up page IDs - handle URLs, dashes, etc
 def normalize_id(raw_id):
     if not isinstance(raw_id, str):
         return raw_id
@@ -26,7 +25,6 @@ ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
 notion = Client(auth=NOTION_TOKEN)
 
 def get_all_pages():
-    """Pull all pages from workspace using search"""
     pages = []
     cursor = None
     while True:
@@ -69,7 +67,6 @@ def make_url(page_id):
     return f"https://www.notion.so/{clean}"
 
 def get_blocks(block_id):
-    """Fetch all child blocks of a block/page, paginated"""
     blocks = []
     cursor = None
     while True:
@@ -86,34 +83,21 @@ def get_blocks(block_id):
         cursor = resp.get("next_cursor")
     return blocks
 
-def extract_text(block):
-    btype = block.get("type")
-    if btype and isinstance(block.get(btype), dict):
-        rich = block[btype].get("rich_text", [])
-        return "".join([t.get("plain_text", "") for t in rich]).strip()
-    return ""
-
-# ===========================================================
-# Extract ALL plain text recursively (tables, columns, captions, properties)
-# ===========================================================
-
+# ===================================================================
+# RECURSIVE TEXT EXTRACTOR (full)
+# ===================================================================
 def extract_all_text_from_block(block):
-    """
-    Recursively extracts all human-readable text from a Notion block,
-    including deeply nested structures (columns, toggles, lists, callouts, synced blocks, tables).
-    Returns a single string (joined).
-    """
     texts = []
     btype = block.get("type")
     content = block.get(btype, {}) if btype else {}
 
-    # 1) rich_text if present
+    # 1) rich_text
     if isinstance(content, dict) and "rich_text" in content:
         rich_text = content.get("rich_text", [])
         if rich_text:
             texts.append(" ".join(t.get("plain_text", "") for t in rich_text if t.get("plain_text")))
 
-    # 2) explicit keys
+    # 2) common text blocks
     for key in [
         "paragraph", "heading_1", "heading_2", "heading_3", "quote", "callout",
         "bulleted_list_item", "numbered_list_item", "toggle", "to_do"
@@ -123,7 +107,7 @@ def extract_all_text_from_block(block):
             if rt:
                 texts.append(" ".join(t.get("plain_text", "") for t in rt if t.get("plain_text")))
 
-    # 3) captions
+    # 3) caption
     if isinstance(content, dict) and "caption" in content:
         cap = content.get("caption", [])
         if cap:
@@ -139,14 +123,14 @@ def extract_all_text_from_block(block):
     if btype == "synced_block":
         synced = block.get("synced_block", {})
         sf = synced.get("synced_from")
-        if sf and isinstance(sf, dict):
+        if sf:
             original_id = sf.get("block_id")
             if original_id:
                 try:
                     children = notion.blocks.children.list(original_id).get("results", [])
                     for child in children:
                         texts.append(extract_all_text_from_block(child))
-                except Exception:
+                except:
                     pass
 
     # 6) table
@@ -159,7 +143,7 @@ def extract_all_text_from_block(block):
                     for cell in cells:
                         if cell:
                             texts.append(" ".join(t.get("plain_text", "") for t in cell if t.get("plain_text")))
-        except Exception:
+        except:
             pass
 
     # 7) child_database
@@ -175,17 +159,19 @@ def extract_all_text_from_block(block):
                         props_text = extract_text_from_properties(row.get("properties", {}) or {})
                         if props_text:
                             texts.append(props_text)
-                        # title
+
+                        # page title in DB row
                         for prop in (row.get("properties", {}) or {}).values():
                             if prop.get("type") == "title":
                                 s = " ".join(t.get("plain_text", "") for t in prop.get("title", []))
                                 if s:
                                     texts.append(s)
                                 break
+
                     if not q.get("has_more"):
                         break
                     next_cursor = q.get("next_cursor")
-            except Exception:
+            except:
                 pass
 
     # 8) recurse into children
@@ -194,16 +180,12 @@ def extract_all_text_from_block(block):
             children = notion.blocks.children.list(block["id"]).get("results", [])
             for child in children:
                 texts.append(extract_all_text_from_block(child))
-    except Exception:
+    except:
         pass
 
     return " ".join(t for t in texts if t).strip()
 
-
 def extract_text_from_properties(properties):
-    """
-    Extract plain text from database page properties.
-    """
     texts = []
     if not isinstance(properties, dict):
         return ""
@@ -235,9 +217,8 @@ def extract_text_from_properties(properties):
 
         elif ptype == "formula":
             f = prop.get("formula", {})
-            if f.get("type") == "string":
-                if f.get("string"):
-                    texts.append(f.get("string"))
+            if f.get("type") == "string" and f.get("string"):
+                texts.append(f.get("string"))
 
         elif ptype == "rollup":
             r = prop.get("rollup", {})
@@ -262,6 +243,7 @@ def extract_text_from_properties(properties):
 
     return " ".join(t for t in texts if t).strip()
 
+
 def detect_lang(text):
     try:
         return detect(text)
@@ -270,6 +252,7 @@ def detect_lang(text):
 
 def count_words(text):
     return len(re.findall(r'\b\w+\b', text))
+
 
 def is_child_of_root(page, root_id, page_index):
     visited = set()
@@ -319,18 +302,24 @@ def is_child_of_root(page, root_id, page_index):
             return False
 
 
+# ===================================================================
+# analyze_page: with UNREADABLE DETECTION
+# ===================================================================
 def analyze_page(page_id):
     ru = 0
     en = 0
+    unreadable = False
 
+    # --------- 1) PROPERTIES ----------
+    props_text = ""
     try:
         page = notion.pages.retrieve(page_id=page_id)
         props = page.get("properties", {}) or {}
         if props:
-            prop_text = extract_text_from_properties(props)
-            if prop_text:
-                lang = detect_lang(prop_text)
-                words = count_words(prop_text)
+            props_text = extract_text_from_properties(props)
+            if props_text:
+                lang = detect_lang(props_text)
+                words = count_words(props_text)
                 if lang == "ru":
                     ru += words
                 elif lang == "en":
@@ -338,7 +327,12 @@ def analyze_page(page_id):
     except:
         pass
 
+    # --------- 2) BLOCKS ----------
     blocks = get_blocks(page_id)
+
+    if not props_text and len(blocks) == 0:
+        unreadable = True
+
     for block in blocks:
         if block.get("type") == "child_page":
             continue
@@ -354,11 +348,13 @@ def analyze_page(page_id):
         elif lang == "en":
             en += words
 
-    return ru, en
+    return ru, en, unreadable
 
 
 def main():
     start = time.time()
+
+    unreadable_pages = []
 
     print("Fetching all pages...")
     pages = get_all_pages()
@@ -387,6 +383,7 @@ def main():
         title = get_title(p)
         url = make_url(pid)
 
+        # Author detection
         author_info = p.get("created_by", {}) or {}
         author = author_info.get("name")
         if not author:
@@ -400,7 +397,13 @@ def main():
         if not author:
             author = "(unknown)"
 
-        ru, en = analyze_page(pid)
+        ru, en, unreadable = analyze_page(pid)
+
+        if unreadable:
+            print(f"⚠ API cannot read page: {title} — {url}")
+            print("   Reason: No properties AND no blocks. Likely not shared with integration.\n")
+            unreadable_pages.append((title, url))
+
         total = ru + en
         ru_pct = (ru / total * 100) if total else 0
         en_pct = (en / total * 100) if total else 0
@@ -413,6 +416,7 @@ def main():
             "% English": round(en_pct, 2)
         })
 
+    # Sorting: English %, then Russian %
     results.sort(key=lambda x: (x["% English"], x["% Russian"]), reverse=True)
 
     fname = "notion_language_percentages.csv"
@@ -425,7 +429,13 @@ def main():
         writer.writerows(results)
 
     print(f"\nSaved {len(results)} rows to {fname}")
-    print(f"Took {time.time() - start:.1f}s")
+
+    if unreadable_pages:
+        print("\n⚠ Pages that API could NOT read (likely missing integration permissions):")
+        for title, url in unreadable_pages:
+            print(f" - {title}: {url}")
+
+    print(f"\nDone in {time.time() - start:.1f}s")
 
 
 if __name__ == "__main__":
