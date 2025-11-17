@@ -27,30 +27,72 @@ NOTION_TOKEN = os.environ.get('NOTION_TOKEN')
 ROOT_PAGE_ID = os.environ.get('ROOT_PAGE_ID')
 MONTHS_THRESHOLD = int(os.environ.get('MONTHS_THRESHOLD', '12'))
 
+print("=" * 100)
+print("DEBUG INFORMATION")
+print("=" * 100)
+print(f"NOTION_TOKEN present: {bool(NOTION_TOKEN)}")
+print(f"ROOT_PAGE_ID: {ROOT_PAGE_ID}")
+print(f"MONTHS_THRESHOLD: {MONTHS_THRESHOLD}")
+print("=" * 100)
+
 # Initialize Notion client
 notion = Client(auth=NOTION_TOKEN)
 
 # Calculate date threshold
 threshold_date = datetime.now() - timedelta(days=MONTHS_THRESHOLD * 30)
 
-def get_all_child_pages(page_id, all_pages=None):
-    """Recursively get all child pages under a parent page"""
+def test_root_page_access():
+    """Test if we can access the root page"""
+    try:
+        print(f"\nTesting access to root page: {ROOT_PAGE_ID}")
+        page = notion.pages.retrieve(page_id=ROOT_PAGE_ID)
+        print(f"✓ Successfully retrieved root page!")
+        print(f"  Page object type: {page.get('object')}")
+        print(f"  Created time: {page.get('created_time')}")
+        print(f"  Last edited: {page.get('last_edited_time')}")
+        return True
+    except Exception as e:
+        print(f"✗ ERROR accessing root page: {e}")
+        print("\nPossible solutions:")
+        print("1. Make sure the ROOT_PAGE_ID is correct")
+        print("2. Share the page with your integration in Notion:")
+        print("   - Open the page in Notion")
+        print("   - Click '...' menu → 'Connections' → Select your integration")
+        return False
+
+def get_all_child_pages(page_id, all_pages=None, depth=0, processed_ids=None):
+    """Recursively get all child pages under a parent page at ALL levels"""
     if all_pages is None:
         all_pages = []
+    if processed_ids is None:
+        processed_ids = set()
+    
+    # Avoid infinite loops by tracking processed pages
+    if page_id in processed_ids:
+        return all_pages
+    processed_ids.add(page_id)
+    
+    indent = "  " * depth
+    print(f"{indent}Scanning page at depth {depth}...")
     
     try:
+        # Get all blocks in this page
         response = notion.blocks.children.list(block_id=page_id, page_size=100)
         
+        print(f"{indent}Found {len(response['results'])} blocks")
+        
+        child_pages_count = 0
+        pages_to_process = []
+        
+        # First pass: collect all child pages
         for block in response['results']:
             if block['type'] in ['child_page', 'child_database']:
-                try:
-                    page = notion.pages.retrieve(page_id=block['id'])
-                    all_pages.append(page)
-                    get_all_child_pages(block['id'], all_pages)
-                except Exception as e:
-                    print(f"Error retrieving page {block['id']}: {e}")
+                child_pages_count += 1
+                pages_to_process.append(block['id'])
         
+        # Handle pagination for first page of results
         while response.get('has_more'):
+            print(f"{indent}Loading more blocks...")
             response = notion.blocks.children.list(
                 block_id=page_id,
                 page_size=100,
@@ -59,17 +101,32 @@ def get_all_child_pages(page_id, all_pages=None):
             
             for block in response['results']:
                 if block['type'] in ['child_page', 'child_database']:
-                    try:
-                        page = notion.pages.retrieve(page_id=block['id'])
-                        all_pages.append(page)
-                        get_all_child_pages(block['id'], all_pages)
-                    except Exception as e:
-                        print(f"Error retrieving page {block['id']}: {e}")
+                    child_pages_count += 1
+                    pages_to_process.append(block['id'])
+        
+        print(f"{indent}Total child pages at this level: {child_pages_count}")
+        
+        # Second pass: retrieve each page and recursively process its children
+        for page_id_to_process in pages_to_process:
+            if page_id_to_process in processed_ids:
+                continue
+                
+            try:
+                page = notion.pages.retrieve(page_id=page_id_to_process)
+                all_pages.append(page)
+                title = get_page_title(page)
+                print(f"{indent}  ✓ Found child page: {title}")
+                
+                # Recursively get children of this page
+                get_all_child_pages(page_id_to_process, all_pages, depth + 1, processed_ids)
+                
+            except Exception as e:
+                print(f"{indent}  ✗ Error retrieving page {page_id_to_process}: {e}")
         
         return all_pages
     
     except Exception as e:
-        print(f"Error listing children of {page_id}: {e}")
+        print(f"{indent}✗ Error listing children of {page_id}: {e}")
         return all_pages
 
 def get_page_title(page):
@@ -98,11 +155,37 @@ def get_user_name(user_id):
 
 def find_stale_pages():
     """Main function to find and report stale pages"""
+    print(f"\n{'=' * 100}")
+    print(f"STARTING SCAN")
+    print(f"{'=' * 100}")
     print(f"Searching for pages not edited since {threshold_date.strftime('%Y-%m-%d')}...\n")
     
-    all_pages = get_all_child_pages(ROOT_PAGE_ID)
-    print(f"Found {len(all_pages)} total pages. Analyzing...\n")
+    # First test if we can access the root page
+    if not test_root_page_access():
+        print("\n⚠️  Cannot access root page. Please fix the issues above and try again.")
+        return
     
+    print(f"\n{'=' * 100}")
+    print("SCANNING FOR CHILD PAGES")
+    print(f"{'=' * 100}\n")
+    
+    # Get all pages under the root page
+    all_pages = get_all_child_pages(ROOT_PAGE_ID)
+    
+    print(f"\n{'=' * 100}")
+    print(f"SCAN COMPLETE")
+    print(f"{'=' * 100}")
+    print(f"Total pages found: {len(all_pages)}\n")
+    
+    if len(all_pages) == 0:
+        print("⚠️  No child pages found under the root page!")
+        print("\nPossible reasons:")
+        print("1. The root page has no subpages")
+        print("2. The subpages are not shared with your integration")
+        print("3. You might need to connect the integration to child pages as well")
+        return
+    
+    # Filter pages that haven't been edited in the threshold period
     stale_pages = []
     
     for page in all_pages:
@@ -123,8 +206,13 @@ def find_stale_pages():
                 'days_since_edit': days_since_edit
             })
     
+    # Sort by last edited time (oldest first)
     stale_pages.sort(key=lambda x: x['last_edited_time'])
     
+    # Print results
+    print(f"\n{'=' * 100}")
+    print(f"RESULTS")
+    print(f"{'=' * 100}")
     print(f"Found {len(stale_pages)} pages not edited in {MONTHS_THRESHOLD} months:\n")
     print("=" * 100)
     
@@ -136,6 +224,7 @@ def find_stale_pages():
         print(f"   URL: {page['url']}")
         print("-" * 100)
     
+    # Export to CSV
     csv_filename = 'stale_notion_pages.csv'
     with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
         fieldnames = ['Title', 'Author', 'Last Editor', 'Last Edited', 'Days Since Edit', 'URL']
@@ -152,21 +241,22 @@ def find_stale_pages():
                 'URL': page['url']
             })
     
-    print(f"\n\nResults saved to {csv_filename}")
+    print(f"\nResults saved to {csv_filename}")
     
     # Create summary for GitHub Actions
-    with open(os.environ.get('GITHUB_STEP_SUMMARY', 'summary.md'), 'w') as f:
-        f.write(f"# Notion Stale Pages Report\n\n")
-        f.write(f"**Total Pages Scanned:** {len(all_pages)}\n\n")
-        f.write(f"**Stale Pages Found:** {len(stale_pages)}\n\n")
-        f.write(f"**Threshold:** Pages not edited in {MONTHS_THRESHOLD} months\n\n")
-        
-        if stale_pages:
-            f.write("## Top 10 Oldest Pages\n\n")
-            f.write("| Title | Last Edited | Days Ago | Author |\n")
-            f.write("|-------|-------------|----------|--------|\n")
-            for page in stale_pages[:10]:
-                f.write(f"| [{page['title']}]({page['url']}) | {page['last_edited_time'][:10]} | {page['days_since_edit']} | {page['author']} |\n")
+    if os.environ.get('GITHUB_STEP_SUMMARY'):
+        with open(os.environ.get('GITHUB_STEP_SUMMARY'), 'w') as f:
+            f.write(f"# Notion Stale Pages Report\n\n")
+            f.write(f"**Total Pages Scanned:** {len(all_pages)}\n\n")
+            f.write(f"**Stale Pages Found:** {len(stale_pages)}\n\n")
+            f.write(f"**Threshold:** Pages not edited in {MONTHS_THRESHOLD} months\n\n")
+            
+            if stale_pages:
+                f.write("## Top 10 Oldest Pages\n\n")
+                f.write("| Title | Last Edited | Days Ago | Author |\n")
+                f.write("|-------|-------------|----------|--------|\n")
+                for page in stale_pages[:10]:
+                    f.write(f"| [{page['title']}]({page['url']}) | {page['last_edited_time'][:10]} | {page['days_since_edit']} | {page['author']} |\n")
 
 if __name__ == "__main__":
     find_stale_pages()
