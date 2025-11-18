@@ -1,10 +1,10 @@
-name: Notion Language Analysis
+name: Notion Column Debug
 
 on:
   workflow_dispatch:
 
 jobs:
-  run-analysis:
+  test-columns:
     runs-on: ubuntu-latest
 
     steps:
@@ -18,17 +18,37 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install notion-client langdetect
+          pip install notion-client
 
-      - name: Run Notion language analysis
+      - name: Run column test
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+          TEST_PAGE_ID: ${{ secrets.TEST_PAGE_ID }}
         run: |
-          python notion_language_check.py
+          cat << 'EOF' > test_columns.py
+from notion_client import Client
 
-      - name: Upload CSV results
-        uses: actions/upload-artifact@v3
-        with:
-          name: notion-language-results
-          path: notion_language_percentages.csv
+notion = Client(auth="${NOTION_TOKEN}")
+page_id = "${TEST_PAGE_ID}"
+
+print("\n🔍 Fetching level 1 blocks...")
+level1 = notion.blocks.children.list(page_id)
+print("LEVEL 1 TYPES:", [b["type"] for b in level1["results"]])
+
+col_list_id = None
+for b in level1["results"]:
+    if b["type"] == "column_list":
+        col_list_id = b["id"]
+        break
+
+print("\ncolumn_list id:", col_list_id)
+
+if not col_list_id:
+    print("❌ No column_list found on this page")
+    exit()
+
+print("\n🔍 Fetching columns inside column_list...")
+cols = notion.blocks.children.list(col_list_id)
+print("COLUMNS:", [c["id"] for c in cols["results"]])
+
+for col in cols["res]()
