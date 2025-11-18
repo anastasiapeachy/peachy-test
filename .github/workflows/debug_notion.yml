@@ -25,30 +25,42 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           TEST_PAGE_ID: ${{ secrets.TEST_PAGE_ID }}
         run: |
-          cat << 'EOF' > test_columns.py
-from notion_client import Client
+          echo "from notion_client import Client
 
-notion = Client(auth="${NOTION_TOKEN}")
-page_id = "${TEST_PAGE_ID}"
+notion = Client(auth='${NOTION_TOKEN}')
+page_id = '${TEST_PAGE_ID}'
 
-print("\n🔍 Fetching level 1 blocks...")
+print('\\n🔍 Fetching level 1 blocks...')
 level1 = notion.blocks.children.list(page_id)
-print("LEVEL 1 TYPES:", [b["type"] for b in level1["results"]])
+print('LEVEL 1 TYPES:', [b['type'] for b in level1['results']])
 
 col_list_id = None
-for b in level1["results"]:
-    if b["type"] == "column_list":
-        col_list_id = b["id"]
+for b in level1['results']:
+    if b['type'] == 'column_list':
+        col_list_id = b['id']
         break
 
-print("\ncolumn_list id:", col_list_id)
+print('\\ncolumn_list id:', col_list_id)
 
 if not col_list_id:
-    print("❌ No column_list found on this page")
+    print('❌ No column_list found on this page')
     exit()
 
-print("\n🔍 Fetching columns inside column_list...")
+print('\\n🔍 Fetching columns inside column_list...')
 cols = notion.blocks.children.list(col_list_id)
-print("COLUMNS:", [c["id"] for c in cols["results"]])
+print('COLUMNS:', [c['id'] for c in cols['results']])
 
-for col in cols["res]()
+for col in cols['results']:
+    cid = col['id']
+    print(f'\\n🔍 Fetching children of column {cid} …')
+    children = notion.blocks.children.list(cid)
+    print('CHILD TYPES:', [ch['type'] for ch in children['results']])
+    for ch in children['results']:
+        r = ch.get(ch['type'], {}).get('rich_text')
+        if r:
+            print(' •', ch['type'], '→', [t.get('plain_text','') for t in r])
+        else:
+            print(' •', ch['type'], '(no rich_text)')
+" > test_columns.py
+
+          python test_columns.py
