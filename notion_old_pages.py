@@ -1,5 +1,6 @@
 import os
 import csv
+import time
 from datetime import datetime, timedelta, timezone
 from notion_client import Client
 from notion_client.errors import APIResponseError
@@ -9,10 +10,11 @@ from notion_client.errors import APIResponseError
 # ------------------------------------
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
-CSV_PATH = os.getenv("CSV_PATH", "notion_old_pages_report.csv")
+CSV_OLD_PATH = os.getenv("CSV_OLD_PATH", "notion_old_pages_report.csv")
+CSV_ALL_PATH = os.getenv("CSV_ALL_PATH", "notion_all_descendants.csv")
 
 if not NOTION_TOKEN or not ROOT_PAGE_ID:
-    raise ValueError("Missing NOTION_TOKEN or ROOT_PAGE_ID")
+    raise ValueError("Missing NOTION_TOKEN or ROOT_PAGE_ID environment variables")
 
 notion = Client(auth=NOTION_TOKEN)
 
@@ -75,14 +77,14 @@ def get_all_pages():
 def find_all_descendants(all_pages, root_id):
     """Returns set of all page IDs that descend from root page (any depth)."""
 
-    # Build a mapping page_id → parent_page_id
+    # Build a mapping: page_id → parent_page_id
     parent_map = {}
     for p in all_pages:
         parent = p.get("parent", {})
         if parent.get("type") == "page_id":
             parent_map[p["id"].replace("-", "")] = parent["page_id"].replace("-", "")
 
-    # BFS/DFS to find all descendants
+    # BFS/DFS to find all nested descendants
     descendants = set()
     stack = [root_id]
 
@@ -101,25 +103,27 @@ def find_all_descendants(all_pages, root_id):
 # ------------------------------------
 def main():
     print("🔍 Fetching all pages via search()…")
+
     all_pages = get_all_pages()
     print(f"📄 Total pages found: {len(all_pages)}")
 
-    # Build descendant tree
+    # Build descendants tree
     print("🔧 Building descendant tree…")
     descendants = find_all_descendants(all_pages, ROOT_PAGE_ID)
-    print(f"📚 Pages under ROOT_PAGE_ID (all levels): {len(descendants)}")
+    print(f"📚 Pages under ROOT_PAGE_ID (all depths): {len(descendants)}")
 
-    # Convert list of page objects to dict by id for fast lookup
+    # Index pages by id for fast lookup
     page_index = {p["id"].replace("-", ""): p for p in all_pages}
 
     old_pages = []
+    all_descendants_list = []  # full list for CSV
 
     for page_id in descendants:
         page = page_index.get(page_id)
         if not page:
             continue
 
-        # Parse last edited (timezone-aware)
+        # Parse last edited timestamp
         last_edited = datetime.fromisoformat(
             page["last_edited_time"].replace("Z", "+00:00")
         )
@@ -136,36 +140,64 @@ def main():
         editor = page.get("last_edited_by", {})
         author = editor.get("person", {}).get("email") or editor.get("name") or "Unknown"
 
+        url = f"https://notion.so/{page['id'].replace('-', '')}"
+
+        # Add to full descendants list
+        all_descendants_list.append({
+            "page_id": page_id,
+            "parent_id": page.get("parent", {}).get("page_id", ""),
+            "title": title,
+            "author": author,
+            "last_edited": last_edited.isoformat(),
+            "url": url
+        })
+
         # Filter old pages
         if last_edited < ONE_YEAR_AGO:
             old_pages.append({
                 "title": title,
                 "author": author,
                 "last_edited": last_edited.isoformat(),
-                "url": f"https://notion.so/{page['id'].replace('-', '')}"
+                "url": url
             })
 
     # -----------------------------------
-    # Save CSV report
+    # Save CSV with ALL descendants
     # -----------------------------------
-    with open(CSV_PATH, "w", encoding="utf-8", newline="") as f:
+    with open(CSV_ALL_PATH, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["page_id", "parent_id", "title", "author", "last_edited", "url"])
+
+        for p in all_descendants_list:
+            writer.writerow([
+                p["page_id"],
+                p["parent_id"],
+                p["title"],
+                p["author"],
+                p["last_edited"],
+                p["url"]
+            ])
+
+    # -----------------------------------
+    # Save CSV with ONLY OLD pages
+    # -----------------------------------
+    with open(CSV_OLD_PATH, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["title", "author", "last_edited", "url"])
+
         for p in old_pages:
             writer.writerow([p["title"], p["author"], p["last_edited"], p["url"]])
 
-    print(f"\n📁 CSV report saved to: {CSV_PATH}")
+    print(f"\n📁 CSV (all descendants) saved to: {CSV_ALL_PATH}")
+    print(f"📁 CSV (old pages) saved to: {CSV_OLD_PATH}")
 
     # Console output
     if not old_pages:
         print("🎉 No outdated pages found!")
     else:
-        print("\n=== Outdated pages (all depths) ===\n")
+        print("\n=== Outdated pages ===\n")
         for p in old_pages:
-            print(f"• {p['title']}")
-            print(f"  Author: {p['author']}")
-            print(f"  Last edited: {p['last_edited']}")
-            print(f"  URL: {p['url']}\n")
+            print(f"• {p['title']} ({p['last_edited']}) — {p['url']}")
 
 
 if __name__ == "__main__":
