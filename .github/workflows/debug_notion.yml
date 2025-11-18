@@ -25,7 +25,8 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           TEST_PAGE_ID: ${{ secrets.TEST_PAGE_ID }}
         run: |
-          echo "from notion_client import Client
+          printf "%s\n" \
+"from notion_client import Client
 
 notion = Client(auth='${NOTION_TOKEN}')
 page_id = '${TEST_PAGE_ID}'
@@ -56,9 +57,10 @@ for col in cols['results']:
     children = notion.blocks.children.list(cid)
     print('CHILD TYPES:', [ch['type'] for ch in children['results']])
     for ch in children['results']:
-        r = ch.get(ch['type'], {}).get('rich_text')
-        if r:
-            print(' •', ch['type'], '→', [t.get('plain_text','') for t in r])
+        data = ch.get(ch['type'], {})
+        rt = data.get('rich_text')
+        if rt:
+            print(' •', ch['type'], '→', [t.get('plain_text','') for t in rt])
         else:
             print(' •', ch['type'], '(no rich_text)')
 " > test_columns.py
