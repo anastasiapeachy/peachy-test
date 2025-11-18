@@ -3,7 +3,9 @@ import re
 from notion_client import Client
 from langdetect import detect
 
-# Берём токен и ID страницы из переменных окружения
+# -------------------------
+# ENV
+# -------------------------
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 PAGE_ID = os.getenv("TEST_PAGE_ID") or os.getenv("ROOT_PAGE_ID")
 
@@ -11,7 +13,6 @@ if not NOTION_TOKEN or not PAGE_ID:
     raise ValueError("Environment vars NOTION_TOKEN and TEST_PAGE_ID or ROOT_PAGE_ID are required")
 
 def normalize_id(raw_id: str) -> str:
-    """Нормализуем Notion ID или URL к 32-символьному hex."""
     if not isinstance(raw_id, str):
         return raw_id
     s = raw_id.strip()
@@ -23,8 +24,10 @@ def normalize_id(raw_id: str) -> str:
 client = Client(auth=NOTION_TOKEN)
 PAGE_ID = normalize_id(PAGE_ID)
 
+# -------------------------
+# FETCH CHILDREN
+# -------------------------
 def get_children(block_id: str):
-    """Забираем всех детей блока (с пагинацией)."""
     all_blocks = []
     cursor = None
     while True:
@@ -35,64 +38,77 @@ def get_children(block_id: str):
         cursor = resp.get("next_cursor")
     return all_blocks
 
+# -------------------------
+# TEXT EXTRACTION — FIXED for synced blocks + columns
+# -------------------------
 def extract_all_text_from_block(block: dict) -> str:
-    """
-    Рекурсивно достаём ВСЁ читаемое человеком:
-    - rich_text
-    - caption'ы
-    - параграфы, заголовки, списки, callout'ы, toggles
-    - детей, включая column_list / column
-    """
     texts = []
     btype = block.get("type")
     content = block.get(btype, {}) if btype else {}
 
-    # rich_text внутри контента блока
+    # ---- 1. rich_text ----
     if isinstance(content, dict):
         if "rich_text" in content:
-            rt = content.get("rich_text") or []
+            rt = content["rich_text"]
             texts.append(" ".join(t.get("plain_text", "") for t in rt if t.get("plain_text")))
 
-        # caption (картинки, bookmark и т.п.)
         if "caption" in content:
-            cap = content.get("caption") or []
+            cap = content["caption"]
             texts.append(" ".join(t.get("plain_text", "") for t in cap if t.get("plain_text")))
 
-    # equation
+    # ---- 2. equation ----
     if btype == "equation":
         eq = content.get("expression")
         if eq:
             texts.append(eq)
 
-    # ВАЖНО: для column_list / column принудительно лезем в детей
+    # ---- 3. synced_block (MAIN FIX) ----
+    if btype == "synced_block":
+        synced = block.get("synced_block", {})
+        src = synced.get("synced_from")
+
+        # If this is a reference — fetch ORIGINAL children
+        if src and isinstance(src, dict):
+            original_id = src.get("block_id")
+            if original_id:
+                try:
+                    original_children = get_children(original_id)
+                    for oc in original_children:
+                        texts.append(extract_all_text_from_block(oc))
+                except Exception as e:
+                    print("Error fetching synced original:", e)
+
+    # ---- 4. Always descend into children for：
+    # column_list, column, and any block with has_children = true
     force_children = btype in ("column_list", "column")
 
     try:
-        if block.get("has_children") or force_children:
+        if force_children or block.get("has_children"):
             children = get_children(block["id"])
             for child in children:
-                child_text = extract_all_text_from_block(child)
-                if child_text:
-                    texts.append(child_text)
+                texts.append(extract_all_text_from_block(child))
     except Exception as e:
-        print(f"Error fetching children for block {block.get('id')}: {e}")
+        print("Error fetching children:", e)
 
     return " ".join(t for t in texts if t).strip()
 
+# -------------------------
+# LANG + WORD COUNT
+# -------------------------
 def detect_lang_safe(text: str) -> str:
-    text = text.strip()
-    if not text:
-        return "unknown"
     try:
         return detect(text)
-    except Exception:
+    except:
         return "unknown"
 
 def count_words(text: str) -> int:
     return len(re.findall(r"\b\w+\b", text))
 
+# -------------------------
+# MAIN
+# -------------------------
 def main():
-    print(f"Testing page: {PAGE_ID}")
+    print(f"\n🔍 Checking page: {PAGE_ID}")
     blocks = get_children(PAGE_ID)
     print(f"Top-level blocks: {len(blocks)}")
 
@@ -102,7 +118,6 @@ def main():
     for block in blocks:
         btype = block.get("type")
 
-        # сабстраницы сейчас не трогаем
         if btype == "child_page":
             continue
 
@@ -113,9 +128,9 @@ def main():
         lang = detect_lang_safe(text)
         words = count_words(text)
 
-        print("-" * 40)
+        print("\n----------------------------------------")
         print(f"Block {block.get('id')} type={btype}")
-        print(f"Detected lang: {lang}, words: {words}")
+        print(f"Detected lang: {lang} | words: {words}")
         print(text[:300] + ("..." if len(text) > 300 else ""))
 
         if lang == "ru":
@@ -130,11 +145,12 @@ def main():
         ru_pct = total_ru / total * 100
         en_pct = total_en / total * 100
 
-    print("=" * 60)
-    print(f"Total RU words: {total_ru}")
-    print(f"Total EN words: {total_en}")
+    print("\n============================================================")
+    print(f"RU words: {total_ru}")
+    print(f"EN words: {total_en}")
     print(f"RU %: {ru_pct:.2f}")
     print(f"EN %: {en_pct:.2f}")
+    print("============================================================")
 
 if __name__ == "__main__":
     main()
