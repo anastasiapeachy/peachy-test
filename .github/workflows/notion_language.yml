@@ -1,33 +1,33 @@
-name: Notion Language Report
+name: Notion Language Check
 
 on:
   workflow_dispatch:
 
 jobs:
-  analyze:
+  run-check:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install notion-client langdetect
+          pip install notion-client==2.2.1
 
-      - name: Run analysis
+      - name: Run script
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
-        run: python notion_language_check.py
+        run: |
+          python notion_language_check.py
 
-      - name: Upload report
+      - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
         with:
           name: notion-language-report
