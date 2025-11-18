@@ -16,24 +16,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: pip install notion-client==2.2.1
 
-      - name: Run script
+      - name: Run Notion scan
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
-          CSV_PATH: "notion_old_pages_report.csv"
         run: python notion_old_pages.py
 
-      - name: Upload CSV (all descendants)
+      - name: Upload CSV artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: notion-all-descendants
-          path: notion_all_descendants.csv
-
-      - name: Upload CSV (old pages)
-        uses: actions/upload-artifact@v4
-        with:
-          name: notion-old-pages
-          path: notion_old_pages_report.csv
+          name: notion-pages
+          path: |
+            notion_all_pages.csv
+            notion_old_pages.csv
