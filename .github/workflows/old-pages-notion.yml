@@ -23,11 +23,11 @@ jobs:
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
-          REPORT_PATH: "notion_old_pages_report.md"
+          CSV_PATH: "notion_old_pages_report.csv"
         run: python notion_old_pages.py
 
-      - name: Upload report
+      - name: Upload CSV report
         uses: actions/upload-artifact@v4
         with:
           name: notion-old-pages-report
-          path: notion_old_pages_report.md
+          path: notion_old_pages_report.csv
