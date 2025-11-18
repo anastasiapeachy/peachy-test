@@ -4,12 +4,12 @@ from datetime import datetime, timedelta, timezone
 from notion_client import Client
 from notion_client.errors import APIResponseError
 
-
 # ------------------------------------
 # Environment
 # ------------------------------------
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
+REPORT_PATH = os.getenv("REPORT_PATH", "notion_old_pages_report.md")
 
 if not NOTION_TOKEN or not ROOT_PAGE_ID:
     raise ValueError("Missing NOTION_TOKEN or ROOT_PAGE_ID environment variables")
@@ -29,7 +29,7 @@ def normalize_id(raw_id: str) -> str:
 
 ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
 
-# Time comparison must be timezone-aware
+# timezone-aware timestamp for "older than 1 year"
 ONE_YEAR_AGO = datetime.now(timezone.utc) - timedelta(days=365)
 
 
@@ -37,7 +37,6 @@ def safe_request(func, *args, **kwargs):
     """
     Safe API call:
     - retry only for rate limiting (429)
-    - avoids 5xx repeat loops (search() rarely fails)
     """
     max_retries = 5
 
@@ -126,21 +125,38 @@ def main():
                 "url": f"https://notion.so/{page['id'].replace('-', '')}"
             })
 
-    # Output result
+    # -----------------------------------
+    # Save report file
+    # -----------------------------------
+    with open(REPORT_PATH, "w", encoding="utf-8") as f:
+        f.write("# Old Notion pages (> 1 year)\n\n")
+
+        if not old_pages:
+            f.write("🎉 No outdated pages found!\n")
+        else:
+            f.write("| Title | Author | Last edited | URL |\n")
+            f.write("| --- | --- | --- | --- |\n")
+
+            for p in old_pages:
+                title = p["title"].replace("|", "\\|")
+                author = p["author"].replace("|", "\\|")
+                last_edited = p["last_edited"]
+                url = p["url"]
+                f.write(f"| {title} | {author} | {last_edited} | {url} |\n")
+
+    # Console output (optional)
     print("\n=== Pages not edited for >1 year ===\n")
 
     if not old_pages:
         print("🎉 No outdated pages found!")
-        return
+    else:
+        for p in old_pages:
+            print(f"• {p['title']}")
+            print(f"  Author: {p['author']}")
+            print(f"  Last edited: {p['last_edited']}")
+            print(f"  URL: {p['url']}\n")
 
-    for p in old_pages:
-        print(f"• {p['title']}")
-        print(f"  Author: {p['author']}")
-        print(f"  Last edited: {p['last_edited']}")
-        print(f"  URL: {p['url']}\n")
-
-    # OPTIONAL: fail job
-    # raise SystemExit("Old pages found — review required.")
+    print(f"📁 Report saved to file: {REPORT_PATH}")
 
 
 if __name__ == "__main__":
