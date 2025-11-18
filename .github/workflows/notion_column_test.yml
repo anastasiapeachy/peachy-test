@@ -1,10 +1,10 @@
-name: Notion column test
+name: Notion Column Test
 
 on:
   workflow_dispatch:
 
 jobs:
-  notion-column-test:
+  test-columns:
     runs-on: ubuntu-latest
 
     env:
@@ -15,16 +15,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install notion-client langdetect
 
-      - name: Run Notion column test
+      - name: Run test
         run: |
           python notion_column_test.py
