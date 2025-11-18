@@ -23,8 +23,10 @@ def normalize_id(raw_id: str) -> str:
 
 ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
 
-ONE_YEAR_AGO = datetime.utcnow() - timedelta(days=365)
+from datetime import datetime, timedelta, timezone
 
+# Instead of datetime.utcnow()
+ONE_YEAR_AGO = datetime.now(timezone.utc) - timedelta(days=365)
 
 # ------------------------------------
 # Safe request (only minimal)
