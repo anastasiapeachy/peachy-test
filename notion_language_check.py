@@ -174,14 +174,29 @@ def extract_all_text_from_block(block):
             except:
                 pass
 
-    # 8) recurse into children
-    try:
-        if block.get("has_children"):
-            children = notion.blocks.children.list(block["id"]).get("results", [])
-            for child in children:
-                texts.append(extract_all_text_from_block(child))
-    except:
-        pass
+# 8) recurse into children (expanded logic for columns)
+try:
+    children = []
+
+    # column_list always contains columns
+    if btype == "column_list":
+        children = notion.blocks.children.list(block["id"]).get("results", [])
+
+    # columns may incorrectly report has_children = false → force fetch children
+    elif btype == "column":
+        children = notion.blocks.children.list(block["id"]).get("results", [])
+
+    # all other blocks
+    elif block.get("has_children"):
+        children = notion.blocks.children.list(block["id"]).get("results", [])
+
+    # recurse
+    if children:
+        for child in children:
+            texts.append(extract_all_text_from_block(child))
+
+except Exception:
+    pass
 
     return " ".join(t for t in texts if t).strip()
 
