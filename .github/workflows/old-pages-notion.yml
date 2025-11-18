@@ -6,25 +6,28 @@ on:
 jobs:
   check-notion:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Debug — list files
-        run: |
-          pwd
-          ls -R .
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install requirements
+      - name: Install dependencies
         run: pip install notion-client==2.2.1
 
       - name: Run script
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+          REPORT_PATH: "notion_old_pages_report.md"
         run: python notion_old_pages.py
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: notion-old-pages-report
+          path: notion_old_pages_report.md
