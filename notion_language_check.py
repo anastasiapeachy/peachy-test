@@ -97,101 +97,83 @@ def get_blocks(block_id):
 # FULL RECURSIVE TEXT EXTRACTOR (INCLUDING COLUMN FIX)
 # ===================================================================
 def extract_all_text_from_block(block):
-    """
-    Recursively extracts ALL human-readable text from ANY Notion block.
-    Always returns a FLAT string (never lists), fully safe for langdetect.
-    """
     texts = []
-
     btype = block.get("type")
     content = block.get(btype, {}) if btype else {}
 
-    # 1) rich_text anywhere
+    # FIX: Handle column_list and column correctly
+    if btype in ("column_list", "column"):
+        try:
+            children = notion.blocks.children.list(block["id"]).get("results", [])
+            for child in children:
+                texts.append(extract_all_text_from_block(child))
+        except:
+            pass
+        return " ".join(t for t in texts if t).strip()
+
+    # 1) rich_text
     if isinstance(content, dict) and "rich_text" in content:
-        for rt in content["rich_text"]:
-            if rt.get("plain_text"):
-                texts.append(rt["plain_text"])
+        rich_text = content.get("rich_text", [])
+        if rich_text:
+            texts.append(" ".join(t.get("plain_text", "") for t in rich_text if t.get("plain_text")))
 
-    # 2) captions (images, embeds, bookmarks, files)
+    # 2) types with rich_text
+    for key in [
+        "paragraph", "heading_1", "heading_2", "heading_3", "quote", "callout",
+        "bulleted_list_item", "numbered_list_item", "toggle", "to_do"
+    ]:
+        if btype == key:
+            rt = block.get(key, {}).get("rich_text", [])
+            if rt:
+                texts.append(" ".join(t.get("plain_text", "") for t in rt if t.get("plain_text")))
+
+    # 3) caption
     if isinstance(content, dict) and "caption" in content:
-        for cap in content["caption"]:
-            if cap.get("plain_text"):
-                texts.append(cap["plain_text"])
-
-    # 3) headings, paragraphs, callouts, to-do, list items
-    BLOCK_TEXT_KEYS = [
-        "paragraph", "heading_1", "heading_2", "heading_3",
-        "quote", "callout", "bulleted_list_item",
-        "numbered_list_item", "toggle", "to_do"
-    ]
-    if btype in BLOCK_TEXT_KEYS:
-        rt = block.get(btype, {}).get("rich_text", [])
-        for t in rt:
-            if t.get("plain_text"):
-                texts.append(t["plain_text"])
+        cap = content.get("caption", [])
+        if cap:
+            texts.append(" ".join(t.get("plain_text", "") for t in cap if t.get("plain_text")))
 
     # 4) equation
     if btype == "equation":
-        expr = block.get("equation", {}).get("expression")
-        if expr:
-            texts.append(expr)
+        eq = block.get("equation", {}).get("expression")
+        if eq:
+            texts.append(eq)
 
-    # 5) synced block – load original content
+    # 5) synced block reference
     if btype == "synced_block":
         synced = block.get("synced_block", {})
         sf = synced.get("synced_from")
-        if sf and isinstance(sf, dict):
+        if sf:
             original_id = sf.get("block_id")
-            if original_id:
-                try:
-                    children = notion.blocks.children.list(original_id).get("results", [])
-                    for ch in children:
-                        txt = extract_all_text_from_block(ch)
-                        if txt:
-                            texts.append(txt)
-                except:
-                    pass
+            try:
+                children = notion.blocks.children.list(original_id).get("results", [])
+                for child in children:
+                    texts.append(extract_all_text_from_block(child))
+            except:
+                pass
 
-    # 6) tables
+    # 6) table rows
     if btype == "table":
         try:
             rows = notion.blocks.children.list(block["id"]).get("results", [])
             for row in rows:
                 if row.get("type") == "table_row":
-                    for cell in row["table_row"]["cells"]:
-                        for t in cell:
-                            if t.get("plain_text"):
-                                texts.append(t["plain_text"])
+                    cells = row["table_row"].get("cells", [])
+                    for cell in cells:
+                        texts.append(" ".join(t.get("plain_text", "") for t in cell if t.get("plain_text")))
         except:
             pass
 
-    # 7) MOST IMPORTANT for your case:
-    # column_list and column — just recurse into children
-    if btype in ("column_list", "column"):
-        try:
-            children = notion.blocks.children.list(block["id"]).get("results", [])
-            for ch in children:
-                txt = extract_all_text_from_block(ch)
-                if txt:
-                    texts.append(txt)
-        except:
-            pass
-
-    # 8) any block with children
+    # 7) recurse deeply into children
     if block.get("has_children"):
         try:
             children = notion.blocks.children.list(block["id"]).get("results", [])
-            for ch in children:
-                txt = extract_all_text_from_block(ch)
-                if txt:
-                    texts.append(txt)
+            for child in children:
+                texts.append(extract_all_text_from_block(child))
         except:
             pass
 
-    # IMPORTANT: return FLAT, CLEAN string
-    flat = " ".join(texts).replace("\n", " ").strip()
-    return flat
-
+    return " ".join(t for t in texts if t).strip()
 
 def extract_text_from_properties(properties):
     texts = []
