@@ -1,0 +1,29 @@
+name: Debug Notion Page
+
+on:
+  workflow_dispatch:
+    inputs:
+      page_id:
+        description: "Notion Page ID to inspect"
+        required: true
+        type: string
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+
+      - name: Install dependencies
+        run: pip install notion-client
+
+      - name: Run dump
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          DEBUG_PAGE_ID: ${{ github.event.inputs.page_id }}
+        run: python debug_notion_dump.py
