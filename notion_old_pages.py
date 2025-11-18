@@ -3,7 +3,7 @@ import csv
 import time
 from datetime import datetime, timedelta, timezone
 from notion_client import Client
-from notion_client.errors import APIResponseError
+from notion_client.errors import APIResponseError, HTTPResponseError
 
 # ------------------------------------
 # Environment
@@ -33,33 +33,54 @@ ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
 
 
 def safe_request(func, *args, **kwargs):
-    """Retry on 429 and 5xx with backoff."""
-    max_retries = 10
-    base_delay = 0.35
-    backoff = 1
+    """
+    Ultra-safe wrapper:
+    - retries on 429
+    - retries on ALL 5xx including 502, 503, 504
+    - retries on network timeouts
+    - exponential backoff (1 → 2 → 4 → ... → 60 sec)
+    """
+    max_retries = 15
+    backoff = 1  # seconds
 
     for attempt in range(max_retries):
         try:
-            time.sleep(base_delay)
             return func(*args, **kwargs)
-        except APIResponseError as e:
-            status = e.status
+
+        except (APIResponseError, HTTPResponseError) as e:
+            status = getattr(e, "status", None)
+
+            # 429 Too Many Requests
             if status == 429:
                 retry_after = int(getattr(e, "headers", {}).get("Retry-After", 1))
-                print(f"[429] Rate limit exceeded. Waiting {retry_after}s...")
+                print(f"[429] Rate limit — waiting {retry_after}s...")
                 time.sleep(retry_after)
                 continue
-            if 500 <= status <= 599:
-                print(f"[{status}] Notion internal error. Retrying in {backoff}s…")
+
+            # Any 5xx (500–599), including 502/503/504
+            if status and 500 <= status <= 599:
+                print(f"[{status}] Server error — retry {attempt+1}/{max_retries} in {backoff}s...")
                 time.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                backoff = min(backoff * 2, 60)  # exponential backoff max 60s
                 continue
-            raise
-    raise RuntimeError("Too many retries.")
+
+            # No status — connection issue, weird API timeout
+            print(f"[NETWORK] Error '{e}' — retrying in {backoff}s...")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
+
+        except Exception as e:
+            print(f"[UNKNOWN ERROR] {e} — retrying in {backoff}s...")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
+
+    raise RuntimeError("Too many retries — Notion API still failing.")
 
 
 def get_block_children(container_id: str):
-    """Get all child blocks of any container (page / block)."""
+    """Retrieve all child blocks (columns, toggles, synced blocks, etc.)."""
     blocks = []
     next_cursor = None
 
@@ -78,12 +99,12 @@ def get_block_children(container_id: str):
 
 
 def get_page_info(page):
-    """Extract title, last_edited, url."""
+    """Extract page title, last edited timestamp, URL."""
     props = page.get("properties", {})
 
     title_prop = props.get("title") or props.get("Name")
     if title_prop and title_prop.get("title"):
-        title = "".join([t["plain_text"] for t in title_prop["title"]])
+        title = "".join(t["plain_text"] for t in title_prop["title"])
     else:
         title = "(untitled)"
 
@@ -96,20 +117,20 @@ def get_page_info(page):
 
 
 def fetch_all_pages_recursively(container_id: str, collected_pages: list):
-    """Find ALL descendants (any depth), including within columns."""
+    """Recursively scan ALL child pages, including those inside columns."""
     children = get_block_children(container_id)
 
     for block in children:
         block_type = block["type"]
 
-        # Child page
+        # Direct child page
         if block_type == "child_page":
             page_id = block["id"]
             page = safe_request(notion.pages.retrieve, page_id)
             collected_pages.append(page)
             fetch_all_pages_recursively(page_id, collected_pages)
 
-        # Any block that can contain children (columns, toggles, synced blocks, etc.)
+        # Any container block with nested content
         if block.get("has_children") and block_type != "child_page":
             fetch_all_pages_recursively(block["id"], collected_pages)
 
@@ -117,23 +138,21 @@ def fetch_all_pages_recursively(container_id: str, collected_pages: list):
 # ------------------------------------
 # Main
 # ------------------------------------
-
 def main():
-    print("🔍 Scanning Notion pages under ROOT_PAGE_ID recursively...")
+    print("🔍 Scanning Notion pages under ROOT recursively...")
 
     all_pages = []
 
-    # Include root page if needed
+    # Try getting root page
     try:
         root_page = safe_request(notion.pages.retrieve, ROOT_PAGE_ID)
         all_pages.append(root_page)
     except Exception as e:
-        print(f"Warning: could not retrieve ROOT page: {e}")
+        print(f"Warning: cannot retrieve ROOT page: {e}")
 
-    # Recursive scanning
     fetch_all_pages_recursively(ROOT_PAGE_ID, all_pages)
 
-    print(f"📄 Total pages found: {len(all_pages)}")
+    print(f"📄 Total pages found (including root): {len(all_pages)}")
 
     records = []
 
@@ -141,59 +160,38 @@ def main():
         title, last_edited, url = get_page_info(page)
         is_old = last_edited < ONE_YEAR_AGO
 
-        records.append(
-            {
-                "title": title,
-                "last_edited": last_edited,
-                "last_edited_str": last_edited.isoformat(),
-                "url": url,
-                "is_older_than_1_year": is_old,
-            }
-        )
+        records.append({
+            "title": title,
+            "last_edited": last_edited,
+            "last_edited_str": last_edited.isoformat(),
+            "url": url,
+            "is_old": "yes" if is_old else "no",
+        })
 
         time.sleep(0.05)
 
-    # Sort by oldest first
+    # Sort by last edited (oldest first)
     records.sort(key=lambda r: r["last_edited"])
 
-    old_pages = [r for r in records if r["is_older_than_1_year"]]
+    old_pages = [r for r in records if r["is_old"] == "yes"]
 
-    print("\n================ OLD PAGES (>1 year) ================\n")
-
-    if not old_pages:
-        print("🎉 No outdated pages found!")
-    else:
-        for p in old_pages:
-            print(f"• {p['title']}")
-            print(f"  Last edited: {p['last_edited_str']}")
-            print(f"  URL: {p['url']}\n")
-
-    # ----------------------------
-    # CSV with ALL pages
-    # ----------------------------
+    # --------------------------------------------
+    # CSV: all pages
+    # --------------------------------------------
     with open("notion_all_pages.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["title", "last_edited", "url", "is_old"])
+        wr = csv.writer(f)
+        wr.writerow(["title", "last_edited", "url", "is_old"])
         for r in records:
-            writer.writerow([
-                r["title"],
-                r["last_edited_str"],
-                r["url"],
-                "yes" if r["is_older_than_1_year"] else "no",
-            ])
+            wr.writerow([r["title"], r["last_edited_str"], r["url"], r["is_old"]])
 
-    # ----------------------------
-    # CSV with old pages only
-    # ----------------------------
+    # --------------------------------------------
+    # CSV: old pages only
+    # --------------------------------------------
     with open("notion_old_pages.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["title", "last_edited", "url"])
+        wr = csv.writer(f)
+        wr.writerow(["title", "last_edited", "url"])
         for r in old_pages:
-            writer.writerow([
-                r["title"],
-                r["last_edited_str"],
-                r["url"],
-            ])
+            wr.writerow([r["title"], r["last_edited_str"], r["url"]])
 
     print("\n📁 CSV saved: notion_all_pages.csv, notion_old_pages.csv")
 
