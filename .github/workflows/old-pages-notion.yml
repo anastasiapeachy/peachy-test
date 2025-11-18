@@ -26,8 +26,14 @@ jobs:
           CSV_PATH: "notion_old_pages_report.csv"
         run: python notion_old_pages.py
 
-      - name: Upload CSV report
+      - name: Upload CSV (all descendants)
         uses: actions/upload-artifact@v4
         with:
-          name: notion-old-pages-report
+          name: notion-all-descendants
+          path: notion_all_descendants.csv
+
+      - name: Upload CSV (old pages)
+        uses: actions/upload-artifact@v4
+        with:
+          name: notion-old-pages
           path: notion_old_pages_report.csv
