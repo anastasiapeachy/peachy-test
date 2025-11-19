@@ -3,108 +3,34 @@ import csv
 import re
 import time
 from notion_client import Client
+from langdetect import detect
 
-# =============================
-# Settings
-# =============================
-
+# ============================
+# ENV VARIABLES
+# ============================
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
 
 if not NOTION_TOKEN or not ROOT_PAGE_ID:
     raise ValueError("Missing NOTION_TOKEN or ROOT_PAGE_ID env vars")
 
-# Normalize ID
+
+# ============================
+# HELPERS
+# ============================
+
 def normalize_id(raw_id):
     if not isinstance(raw_id, str):
         return raw_id
     s = raw_id.strip()
-    # strip all non-hex chars
-    cleaned = re.sub(r"[^0-9a-fA-F]", "", s)
-    # if 32-character hex -> OK
-    if len(cleaned) == 32:
-        return cleaned.lower()
-    return cleaned.lower()
+    match = re.search(r"([0-9a-fA-F]{32})", s.replace("-", ""))
+    if match:
+        return match.group(1)
+    return s.replace("-", "")
+
 
 ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
-
 notion = Client(auth=NOTION_TOKEN)
-
-# =============================
-# PROFESSIONAL LANGUAGE DETECTOR
-# =============================
-
-RU_CHARS = set("абвгдеёжзийклмнопрстуфхцчшщьыъэюя")
-EN_CHARS = set("abcdefghijklmnopqrstuvwxyz")
-
-def detect_lang_pro(text: str):
-    """Professional heuristic language detection (EN vs RU)."""
-    if not text:
-        return "unknown"
-
-    t = text.lower()
-
-    ru_count = sum(c in RU_CHARS for c in t)
-    en_count = sum(c in EN_CHARS for c in t)
-
-    # If both exist, choose the dominant script
-    if ru_count > en_count:
-        return "ru"
-    if en_count > ru_count:
-        return "en"
-
-    # fallback
-    if ru_count > 0:
-        return "ru"
-    if en_count > 0:
-        return "en"
-
-    return "unknown"
-
-
-def count_words(text: str):
-    return len(re.findall(r"\b\w+\b", text))
-
-
-# =============================
-# PAGE GATHERING
-# =============================
-
-def get_all_pages():
-    """Retrieve all pages from workspace."""
-    pages = []
-    cursor = None
-    while True:
-        resp = notion.search(
-            query="",
-            filter={"value": "page", "property": "object"},
-            start_cursor=cursor
-        )
-        pages.extend(resp.get("results", []))
-        if not resp.get("has_more"):
-            break
-        cursor = resp.get("next_cursor")
-    return pages
-
-
-def get_title(page):
-    """Extract title from page or fallback."""
-    props = page.get("properties", {}) or {}
-    for prop in props.values():
-        if prop.get("type") == "title":
-            parts = [t.get("plain_text", "") for t in prop.get("title", [])]
-            if parts:
-                return "".join(parts)
-
-    # fallback for child_page
-    try:
-        blk = notion.blocks.retrieve(block_id=page["id"])
-        if blk.get("type") == "child_page":
-            return blk["child_page"].get("title", "(untitled)")
-    except:
-        pass
-
-    return "(untitled)"
 
 
 def make_url(page_id):
@@ -113,14 +39,14 @@ def make_url(page_id):
 
 
 def get_blocks(block_id):
-    """Fetch direct children of a block/page."""
+    """Fetch all direct children blocks."""
     blocks = []
     cursor = None
     while True:
-        resp = notion.blocks.children.list(
-            block_id=block_id,
-            start_cursor=cursor
-        )
+        try:
+            resp = notion.blocks.children.list(block_id=block_id, start_cursor=cursor)
+        except Exception:
+            break
         blocks.extend(resp.get("results", []))
         if not resp.get("has_more"):
             break
@@ -128,293 +54,274 @@ def get_blocks(block_id):
     return blocks
 
 
-# =============================
-# TEXT EXTRACTION ENGINE
-# =============================
+# ===================================================================
+# 1) FULL RECURSIVE PAGE TREE WALKER (NO search(), NO workspace crawl)
+# ===================================================================
 
-RICH_TEXT_TYPES = {
-    "paragraph",
-    "heading_1",
-    "heading_2",
-    "heading_3",
-    "quote",
-    "callout",
-    "bulleted_list_item",
-    "numbered_list_item",
-    "toggle",
-    "to_do"
-}
+def get_all_descendant_pages(root_page_id):
+    """
+    Recursively walks ONLY the subtree of ROOT_PAGE_ID.
+    Returns page_id list NEVER containing external pages.
+    """
+    visited = set()
+    collected = []
 
-def extract_richtext(rt_list):
-    return " ".join(
-        t.get("plain_text", "")
-        for t in (rt_list or [])
-        if t.get("plain_text")
-    )
+    def walk(page_id):
+        if page_id in visited:
+            return
+        visited.add(page_id)
 
+        collected.append(page_id)   # add page itself
+
+        # read blocks of this page
+        try:
+            blocks = get_blocks(page_id)
+        except:
+            return
+
+        for block in blocks:
+            btype = block.get("type")
+
+            # --- CASE 1: normal child_page ---
+            if btype == "child_page":
+                walk(normalize_id(block["id"]))
+
+            # --- CASE 2: inline database ---
+            if btype == "child_database":
+                db_id = block["child_database"]["database_id"]
+                cursor = None
+                try:
+                    while True:
+                        q = notion.databases.query(database_id=db_id, start_cursor=cursor)
+                        for row in q.get("results", []):
+                            walk(normalize_id(row["id"]))
+                        if not q.get("has_more"):
+                            break
+                        cursor = q.get("next_cursor")
+                except:
+                    pass
+
+            # --- CASE 3: synced block referencing other block ---
+            if btype == "synced_block":
+                sf = block.get("synced_block", {}).get("synced_from")
+                if sf and sf.get("block_id"):
+                    try:
+                        ref_children = notion.blocks.children.list(sf["block_id"]).get("results", [])
+                        for c in ref_children:
+                            if c.get("type") == "child_page":
+                                walk(normalize_id(c["id"]))
+                    except:
+                        pass
+
+            # --- CASE 4: nested columns, toggles, etc. ---
+            if block.get("has_children"):
+                try:
+                    children = notion.blocks.children.list(block["id"]).get("results", [])
+                    for c in children:
+                        if c.get("type") == "child_page":
+                            walk(normalize_id(c["id"]))
+                except:
+                    pass
+
+    walk(root_page_id)
+    return collected
+
+
+# ===================================================================
+# 2) EXTRACT TEXT FROM BLOCKS (INCLUDING COLUMNS)
+# ===================================================================
 
 def extract_all_text_from_block(block):
-    """Fully recursive, stable, column-aware text extractor."""
-
     texts = []
     btype = block.get("type")
-    if not btype:
-        return ""
+    content = block.get(btype, {}) if btype else {}
 
-    content = block.get(btype, {}) or {}
-
-    # 1) COLUMN FIX
+    # --- FIX: column_list / column ---
     if btype in ("column_list", "column"):
-        children = get_blocks(block["id"])
-        for child in children:
-            texts.append(extract_all_text_from_block(child))
+        try:
+            children = notion.blocks.children.list(block["id"]).get("results", [])
+            for child in children:
+                texts.append(extract_all_text_from_block(child))
+        except:
+            pass
         return " ".join(t for t in texts if t).strip()
 
-    # 2) Standard rich_text blocks
-    if btype in RICH_TEXT_TYPES:
+    # 1) generic rich_text
+    if isinstance(content, dict) and "rich_text" in content:
         rt = content.get("rich_text", [])
         if rt:
-            texts.append(extract_richtext(rt))
+            texts.append(" ".join(t.get("plain_text", "") for t in rt if t.get("plain_text")))
 
-    # 3) caption
+    # 2) specific block types with rich text
+    for t in [
+        "paragraph", "heading_1", "heading_2", "heading_3",
+        "quote", "callout", "bulleted_list_item",
+        "numbered_list_item", "toggle", "to_do"
+    ]:
+        if btype == t:
+            rt = block.get(t, {}).get("rich_text", [])
+            texts.append(" ".join(tt.get("plain_text", "") for tt in rt))
+
+    # 3) captions
     if isinstance(content, dict) and "caption" in content:
-        texts.append(extract_richtext(content.get("caption", [])))
+        cap = content.get("caption", [])
+        texts.append(" ".join(t.get("plain_text", "") for t in cap))
 
-    # 4) synced_block reference
+    # 4) equations
+    if btype == "equation":
+        eq = block.get("equation", {}).get("expression")
+        if eq:
+            texts.append(eq)
+
+    # 5) synced blocks with external references
     if btype == "synced_block":
-        synced = content
-        if synced.get("synced_from"):
-            original_id = synced["synced_from"].get("block_id")
-            if original_id:
-                original_children = get_blocks(original_id)
-                for ch in original_children:
-                    texts.append(extract_all_text_from_block(ch))
-
-    # 5) tables
-    if btype == "table":
-        rows = get_blocks(block["id"])
-        for row in rows:
-            if row.get("type") == "table_row":
-                for cell in row["table_row"].get("cells", []):
-                    texts.append(extract_richtext(cell))
-
-    # 6) Deep recursion
-    if block.get("has_children"):
-        children = get_blocks(block["id"])
-        for child in children:
-            texts.append(extract_all_text_from_block(child))
-
-    return " ".join(t for t in texts if t).strip()
-
-
-# =============================
-# PROPERTY TEXT EXTRACTOR
-# =============================
-
-def extract_text_from_properties(properties):
-    texts = []
-    if not isinstance(properties, dict):
-        return ""
-
-    for prop in properties.values():
-        ptype = prop.get("type")
-
-        if ptype == "title":
-            texts.append(extract_richtext(prop.get("title")))
-
-        elif ptype == "rich_text":
-            texts.append(extract_richtext(prop.get("rich_text")))
-
-        elif ptype == "select" and prop.get("select"):
-            texts.append(prop["select"].get("name", ""))
-
-        elif ptype == "multi_select":
-            for item in prop.get("multi_select", []):
-                texts.append(item.get("name", ""))
-
-        elif ptype == "status" and prop.get("status"):
-            texts.append(prop["status"].get("name", ""))
-
-        elif ptype == "formula":
-            f = prop.get("formula", {})
-            if f.get("type") == "string" and f.get("string"):
-                texts.append(f.get("string"))
-
-        elif ptype == "rollup":
-            r = prop.get("rollup", {})
-            if r.get("type") == "array":
-                for item in r.get("array", []):
-                    if "title" in item:
-                        texts.append(extract_richtext(item["title"]))
-                    if "rich_text" in item:
-                        texts.append(extract_richtext(item["rich_text"]))
-
-        elif ptype == "people":
-            for u in prop.get("people", []):
-                if u.get("name"):
-                    texts.append(u["name"])
-
-        elif ptype in ("number", "url", "email", "phone") and prop.get(ptype):
-            texts.append(str(prop[ptype]))
-
-    return " ".join(t for t in texts if t).strip()
-
-
-# =============================
-# HIERARCHY CHECK
-# =============================
-
-def is_child_of_root(page, root_id, page_index):
-    """
-    Strict mode (A):
-    - Only page_id and database_id are allowed in the chain.
-    - ANY block_id parent → immediately return False.
-    """
-
-    visited = set()
-    current = page
-
-    while True:
-        parent = current.get("parent", {}) or {}
-        ptype = parent.get("type")
-
-        # --- Direct page parent ---
-        if ptype == "page_id":
-            pid = normalize_id(parent.get("page_id"))
-            if pid == root_id:
-                return True
-            if pid in visited:
-                return False
-            visited.add(pid)
-
-            # Move upward
-            current = page_index.get(pid) or notion.pages.retrieve(page_id=pid)
-            continue
-
-        # --- Database parent (allowed) ---
-        elif ptype == "database_id":
-            dbid = parent.get("database_id")
+        sf = block.get("synced_block", {}).get("synced_from")
+        if sf and sf.get("block_id"):
             try:
-                db = notion.databases.retrieve(database_id=dbid)
-                db_parent = db.get("parent", {})
-
-                # Only allow page_id as parent of DB
-                if db_parent.get("type") != "page_id":
-                    return False
-
-                pid = normalize_id(db_parent.get("page_id"))
-                if pid == root_id:
-                    return True
-
-                if pid in visited:
-                    return False
-                visited.add(pid)
-
-                current = page_index.get(pid) or notion.pages.retrieve(page_id=pid)
-                continue
-
-            except Exception:
-                return False
-
-        # --- Block parent (STRICT MODE) ---
-        elif ptype == "block_id":
-            # ❗ Strict mode: ANY block_id → NOT child of root
-            return False
-
-        # --- Anything else → not a child ---
-        else:
-            return False
-
-        # block parent
-        if ptype == "block_id":
-            bid = parent.get("block_id")
-            try:
-                blk = notion.blocks.retrieve(block_id=bid)
-                current = {"id": bid, "parent": blk.get("parent", {})}
-                continue
+                external = notion.blocks.children.list(sf["block_id"]).get("results", [])
+                for c in external:
+                    texts.append(extract_all_text_from_block(c))
             except:
-                return False
+                pass
 
-        return False
+    # 6) tables
+    if btype == "table":
+        try:
+            rows = notion.blocks.children.list(block["id"]).get("results", [])
+            for row in rows:
+                if row.get("type") == "table_row":
+                    cells = row["table_row"]["cells"]
+                    for cell in cells:
+                        texts.append(" ".join(t.get("plain_text", "") for t in cell))
+        except:
+            pass
+
+    # 7) deep recursion
+    if block.get("has_children"):
+        try:
+            children = notion.blocks.children.list(block["id"]).get("results", [])
+            for c in children:
+                texts.append(extract_all_text_from_block(c))
+        except:
+            pass
+
+    return " ".join(t for t in texts if t).strip()
 
 
-# =============================
-# PAGE ANALYSIS
-# =============================
+# ===================================================================
+# 3) DETECT LANG + WORD COUNT
+# ===================================================================
+
+def detect_lang(text):
+    try:
+        return detect(text)
+    except:
+        return "unknown"
+
+
+def count_words(text):
+    return len(re.findall(r'\b\w+\b', text))
+
+
+# ===================================================================
+# 4) EXTRACT TEXT FROM PROPERTIES (DB PAGES)
+# ===================================================================
+
+def extract_text_from_properties(props):
+    if not isinstance(props, dict):
+        return ""
+    collected = []
+    for p in props.values():
+        t = p.get("type")
+
+        if t == "title":
+            collected.append(" ".join(tt.get("plain_text", "") for tt in p.get("title", [])))
+        elif t == "rich_text":
+            collected.append(" ".join(tt.get("plain_text", "") for tt in p.get("rich_text", [])))
+        elif t == "select" and p.get("select"):
+            collected.append(p["select"]["name"])
+        elif t == "multi_select":
+            collected.extend(item["name"] for item in p.get("multi_select", []))
+        elif t == "status" and p.get("status"):
+            collected.append(p["status"]["name"])
+        elif t == "formula":
+            f = p.get("formula", {})
+            if f.get("type") == "string" and f.get("string"):
+                collected.append(f["string"])
+        elif t == "people":
+            for u in p.get("people", []):
+                if u.get("name"):
+                    collected.append(u["name"])
+
+    return " ".join(collected).strip()
+
+
+# ===================================================================
+# 5) ANALYZE SINGLE PAGE
+# ===================================================================
 
 def analyze_page(page_id):
     ru = 0
     en = 0
-    unreadable = False
 
-    # 1) Props
+    # properties
     try:
-        page = notion.pages.retrieve(page_id=page_id)
-        props_text = extract_text_from_properties(page.get("properties", {}))
+        p = notion.pages.retrieve(page_id=page_id)
+        prop_text = extract_text_from_properties(p.get("properties", {}))
+        lang = detect_lang(prop_text)
+        words = count_words(prop_text)
+        if lang == "ru": ru += words
+        elif lang == "en": en += words
+    except:
+        pass
 
-        if props_text:
-            lang = detect_lang_pro(props_text)
-            words = count_words(props_text)
-            if lang == "ru":
-                ru += words
-            elif lang == "en":
-                en += words
-
-    except Exception:
-        props_text = ""
-
-    # 2) Content blocks
-    blocks = get_blocks(page_id)
-
-    if not props_text and not blocks:
-        unreadable = True
+    # blocks
+    try:
+        blocks = get_blocks(page_id)
+    except:
+        return ru, en
 
     for block in blocks:
         if block.get("type") == "child_page":
             continue
-
         text = extract_all_text_from_block(block)
-        if not text:
-            continue
-
-        lang = detect_lang_pro(text)
+        lang = detect_lang(text)
         words = count_words(text)
+        if lang == "ru": ru += words
+        elif lang == "en": en += words
 
-        if lang == "ru":
-            ru += words
-        elif lang == "en":
-            en += words
-
-    return ru, en, unreadable
+    return ru, en
 
 
-# =============================
-# MAIN
-# =============================
+# ===================================================================
+# 6) MAIN
+# ===================================================================
 
 def main():
     start = time.time()
-    print("Fetching pages...")
-    pages = get_all_pages()
-    print(f"Total pages in workspace: {len(pages)}")
 
-    page_index = {normalize_id(p["id"]): p for p in pages}
+    print(f"Walking only subtree of ROOT: {ROOT_PAGE_ID}")
 
-    # Filter pages inside root
-    selected = []
-    for p in pages:
-        pid = normalize_id(p["id"])
-        if pid == ROOT_PAGE_ID or is_child_of_root(p, ROOT_PAGE_ID, page_index):
-            selected.append(p)
-
-    print(f"Pages under root: {len(selected)}")
+    # Get only allowed pages
+    page_ids = get_all_descendant_pages(ROOT_PAGE_ID)
+    print(f"Found {len(page_ids)} pages inside root tree")
 
     results = []
-    unreadable_pages = []
 
-    for p in selected:
-        pid = normalize_id(p["id"])
-        title = get_title(p)
+    for pid in page_ids:
+        try:
+            p = notion.pages.retrieve(page_id=pid)
+        except:
+            continue
+
+        # title
+        title = "(untitled)"
+        props = p.get("properties", {})
+        for prop in props.values():
+            if prop.get("type") == "title":
+                t = "".join(tt.get("plain_text", "") for tt in prop["title"])
+                if t.strip():
+                    title = t
         url = make_url(pid)
 
         # author
@@ -429,14 +336,11 @@ def main():
         if not author:
             author = "(unknown)"
 
-        ru, en, unreadable = analyze_page(pid)
-
-        if unreadable:
-            unreadable_pages.append((title, url))
-
+        # language stats
+        ru, en = analyze_page(pid)
         total = ru + en
-        ru_pct = round((ru / total * 100), 2) if total else 0
-        en_pct = round((en / total * 100), 2) if total else 0
+        ru_pct = round((ru / total * 100) if total else 0, 2)
+        en_pct = round((en / total * 100) if total else 0, 2)
 
         results.append({
             "Page Title": title,
@@ -446,26 +350,20 @@ def main():
             "% English": en_pct
         })
 
-    # sort by English desc
-    results.sort(key=lambda x: (x["% English"], x["% Russian"]), reverse=True)
+    # sort
+    results.sort(key=lambda r: (r["% English"], r["% Russian"]), reverse=True)
 
+    # write CSV
     fname = "notion_language_percentages.csv"
     with open(fname, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["Page Title", "Page URL", "Author", "% Russian", "% English"]
-        )
+        writer = csv.DictWriter(f, fieldnames=[
+            "Page Title", "Page URL", "Author", "% Russian", "% English"
+        ])
         writer.writeheader()
         writer.writerows(results)
 
-    print(f"\nSaved CSV: {fname}")
-
-    if unreadable_pages:
-        print("\n⚠ Unreadable pages (not shared with integration):")
-        for title, url in unreadable_pages:
-            print(f" - {title}: {url}")
-
-    print(f"\nDone in {time.time() - start:.1f}s")
+    print(f"\nSaved {len(results)} rows to {fname}")
+    print(f"Done in {time.time() - start:.1f}s")
 
 
 if __name__ == "__main__":
