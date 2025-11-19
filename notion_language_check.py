@@ -265,43 +265,64 @@ def extract_text_from_properties(properties):
 # =============================
 
 def is_child_of_root(page, root_id, page_index):
-    """Walk parents until root matched or external."""
+    """
+    Strict mode (A):
+    - Only page_id and database_id are allowed in the chain.
+    - ANY block_id parent → immediately return False.
+    """
+
     visited = set()
     current = page
+
     while True:
         parent = current.get("parent", {}) or {}
         ptype = parent.get("type")
 
-        # direct page_id parent
+        # --- Direct page parent ---
         if ptype == "page_id":
             pid = normalize_id(parent.get("page_id"))
             if pid == root_id:
                 return True
-
             if pid in visited:
                 return False
-
             visited.add(pid)
+
+            # Move upward
             current = page_index.get(pid) or notion.pages.retrieve(page_id=pid)
             continue
 
-        # parent is DB → check DB parent
-        if ptype == "database_id":
+        # --- Database parent (allowed) ---
+        elif ptype == "database_id":
             dbid = parent.get("database_id")
             try:
                 db = notion.databases.retrieve(database_id=dbid)
-                dbp = db.get("parent", {})
-                if dbp.get("type") == "page_id":
-                    pid = normalize_id(dbp["page_id"])
-                    if pid == root_id:
-                        return True
-                    if pid in visited:
-                        return False
-                    visited.add(pid)
-                    current = page_index.get(pid) or notion.pages.retrieve(page_id=pid)
-                    continue
-            except:
+                db_parent = db.get("parent", {})
+
+                # Only allow page_id as parent of DB
+                if db_parent.get("type") != "page_id":
+                    return False
+
+                pid = normalize_id(db_parent.get("page_id"))
+                if pid == root_id:
+                    return True
+
+                if pid in visited:
+                    return False
+                visited.add(pid)
+
+                current = page_index.get(pid) or notion.pages.retrieve(page_id=pid)
+                continue
+
+            except Exception:
                 return False
+
+        # --- Block parent (STRICT MODE) ---
+        elif ptype == "block_id":
+            # ❗ Strict mode: ANY block_id → NOT child of root
+            return False
+
+        # --- Anything else → not a child ---
+        else:
             return False
 
         # block parent
