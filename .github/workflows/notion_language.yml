@@ -7,15 +7,9 @@ jobs:
   run-check:
     runs-on: ubuntu-latest
 
-    permissions:
-      contents: read
-
     steps:
-      - name: Checkout repo (LFS enabled)
+      - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          lfs: true
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -24,9 +18,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install notion-client==2.2.1
+          python -m pip install --upgrade pip
+          pip install notion-client==2.2.1 langdetect
 
-      - name: Run script
+      - name: Run Notion Language Check
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
@@ -38,3 +33,4 @@ jobs:
         with:
           name: notion-language-report
           path: notion_language_percentages.csv
+          if-no-files-found: error
