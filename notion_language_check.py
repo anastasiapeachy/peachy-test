@@ -118,9 +118,7 @@ def extract_all_text_from_block(block):
     btype = block.get("type")
     content = block.get(btype, {}) if btype else {}
 
-    # -------------------------------------------
-    # 1. column_list / column
-    # -------------------------------------------
+    # 1) Handle column_list & column properly
     if btype in ("column_list", "column"):
         try:
             children = notion.blocks.children.list(block["id"]).get("results", [])
@@ -130,74 +128,64 @@ def extract_all_text_from_block(block):
             pass
         return " ".join(t for t in texts if t).strip()
 
-    # -------------------------------------------
-    # 2. rich_text-based blocks
-    # -------------------------------------------
-    if isinstance(content, dict):
-        rt = content.get("rich_text")
-        if rt:
+    # 2) rich_text
+    if isinstance(content, dict) and "rich_text" in content:
+        rt = content.get("rich_text", [])
+        texts.append(" ".join(t.get("plain_text", "") for t in rt if t.get("plain_text")))
+
+    # 3) blocks that store rich_text inside a nested key
+    for key in (
+        "paragraph", "heading_1", "heading_2", "heading_3", "quote", "callout",
+        "bulleted_list_item", "numbered_list_item", "toggle", "to_do"
+    ):
+        if btype == key:
+            rt = block[key].get("rich_text", [])
             texts.append(" ".join(t.get("plain_text", "") for t in rt if t.get("plain_text")))
 
-    # -------------------------------------------
-    # 3. common text blocks
-    # -------------------------------------------
-    for key in [
-        "paragraph", "heading_1", "heading_2", "heading_3", "quote", "callout",
-        "bulleted_list_item", "numbered_list_item", "toggle", "to_do", "code"
-    ]:
-        if btype == key:
-            rt = block.get(key, {}).get("rich_text", [])
-            if rt:
-                texts.append(" ".join(t.get("plain_text", "") for t in rt if t.get("plain_text")))
-
-    # -------------------------------------------
-    # 4. caption blocks (image, video, etc.)
-    # -------------------------------------------
+    # 4) caption (images, files, embeds)
     if isinstance(content, dict) and "caption" in content:
-        cap = content.get("caption", [])
-        if cap:
-            texts.append(" ".join(t.get("plain_text", "") for t in cap if t.get("plain_text")))
+        caption = content.get("caption", [])
+        texts.append(" ".join(t.get("plain_text", "") for t in caption if t.get("plain_text")))
 
-    # -------------------------------------------
-    # 5. synced_block reference
-    # -------------------------------------------
-    if btype == "synced_block":
-        synced = block.get("synced_block", {})
-        sf = synced.get("synced_from")
-        if sf:
-            original_id = sf.get("block_id")
-            try:
-                children = notion.blocks.children.list(original_id).get("results", [])
-                for child in children:
-                    texts.append(extract_all_text_from_block(child))
-            except:
-                pass
+    # 5) equations
+    if btype == "equation":
+        eq = block["equation"].get("expression")
+        if eq:
+            texts.append(eq)
 
-    # -------------------------------------------
-    # 6. table rows
-    # -------------------------------------------
+    # 6) table rows
     if btype == "table":
         try:
             rows = notion.blocks.children.list(block["id"]).get("results", [])
             for row in rows:
                 if row.get("type") == "table_row":
-                    for cell in row["table_row"]["cells"]:
-                        texts.append(" ".join(
-                            t.get("plain_text", "") for t in cell if t.get("plain_text")
-                        ))
+                    cells = row["table_row"]["cells"]
+                    for cell in cells:
+                        texts.append(" ".join(t.get("plain_text", "") for t in cell if t.get("plain_text")))
         except:
             pass
 
-    # -------------------------------------------
-    # 7. recurse into children ALWAYS
-    # -------------------------------------------
-    try:
-        if block.get("has_children"):
+    # 7) synced_block reference
+    if btype == "synced_block":
+        sf = block["synced_block"].get("synced_from")
+        if sf:
+            original = sf.get("block_id")
+            if original:
+                try:
+                    orig_children = notion.blocks.children.list(original).get("results", [])
+                    for child in orig_children:
+                        texts.append(extract_all_text_from_block(child))
+                except:
+                    pass
+
+    # 8) Deep children recursion
+    if block.get("has_children"):
+        try:
             children = notion.blocks.children.list(block["id"]).get("results", [])
             for child in children:
                 texts.append(extract_all_text_from_block(child))
-    except:
-        pass
+        except:
+            pass
 
     return " ".join(t for t in texts if t).strip()
 
