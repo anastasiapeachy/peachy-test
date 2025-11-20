@@ -1,218 +1,188 @@
+from notion_client import Client
+import json
 import os
-import csv
 import time
 import requests
-from datetime import datetime, timedelta, timezone
-from notion_client import Client
-from notion_client.errors import APIResponseError, HTTPResponseError
+from datetime import datetime, timezone, timedelta
+import csv
 
-# ========================
-# ENV
-# ========================
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
-
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-SLACK_CHANNEL = os.getenv("SLACK_CHANNEL")  # если хочешь использовать — webhook может игнорировать его
-
-if not all([NOTION_TOKEN, ROOT_PAGE_ID, SLACK_WEBHOOK_URL]):
-    raise ValueError("Missing required environment variables.")
 
 notion = Client(auth=NOTION_TOKEN)
 
-NOW = datetime.now(timezone.utc)
-ONE_YEAR_AGO = NOW - timedelta(days=365)
+ONE_YEAR_AGO = datetime.now(timezone.utc) - timedelta(days=365)
 
 
-# ========================
-# HELPERS
-# ========================
+# ============================================
+# Helpers
+# ============================================
 
-def normalize_id(raw: str):
-    raw = raw.strip()
-    if "/" in raw:
-        raw = raw.split("/")[-1]
-    return raw.replace("-", "")
-
-ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
+def notion_url(page_id):
+    clean_id = page_id.replace("-", "")
+    return f"https://www.notion.so/{clean_id}"
 
 
-def safe_request(func, *args, **kwargs):
+def get_page_info(page_id):
+    """Return full details of a Notion page."""
+    page = notion.pages.retrieve(page_id=page_id)
+
+    # Title
+    title = "Untitled"
+    if "properties" in page:
+        for prop in page["properties"].values():
+            if prop["type"] == "title" and prop.get("title"):
+                title = prop["title"][0]["plain_text"]
+                break
+
+    # Last edited
+    last_raw = page.get("last_edited_time", "")
+    if last_raw:
+        last_dt = datetime.fromisoformat(last_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+    else:
+        last_dt = None
+
+    return {
+        "id": page_id,
+        "title": title,
+        "url": notion_url(page_id),
+        "last_edited": last_dt,
+    }
+
+
+def get_all_pages(block_id):
     """
-    ЖЕЛЕЗОБЕТОННЫЙ запрос к Notion API.
-    Переживает 429/500/502/503/504/timeout/connection reset.
+    Recursively fetch all child pages.
+    EXACT same recursion style as your sample code.
     """
-    max_retries = 15
-    backoff = 1
-
-    for _ in range(max_retries):
-        try:
-            return func(*args, **kwargs)
-
-        except (APIResponseError, HTTPResponseError) as e:
-            status = getattr(e, "status", None)
-
-            # Rate limit
-            if status == 429:
-                retry = int(getattr(e, "headers", {}).get("Retry-After", 1))
-                print(f"[429] Waiting {retry}s…")
-                time.sleep(retry)
-                continue
-
-            # Server issues
-            if status and 500 <= status <= 599:
-                print(f"[{status}] Server error — retry in {backoff}s…")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-                continue
-
-            print(f"[NETWORK] {e} — retry in {backoff}s…")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-
-        except Exception as e:
-            print(f"[UNKNOWN ERROR] {e} — retry in {backoff}s…")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-
-    raise RuntimeError("Too many retries — Notion still failing.")
-
-
-# ========================
-# NOTION RECURSIVE SCAN
-# ========================
-
-def get_block_children(block_id: str):
-    blocks = []
-    cursor = None
+    pages = []
+    response = notion.blocks.children.list(block_id=block_id)
 
     while True:
-        response = safe_request(
-            notion.blocks.children.list,
-            block_id=block_id,
-            start_cursor=cursor
-        )
-        blocks.extend(response.get("results", []))
-        cursor = response.get("next_cursor")
-        if not cursor:
+        for block in response["results"]:
+            if block["type"] == "child_page":
+                page_id = block["id"]
+                try:
+                    info = get_page_info(page_id)
+                    pages.append(info)
+                    pages.extend(get_all_pages(page_id))
+                except Exception as e:
+                    print(f"Skipping page {page_id}: {e}")
+
+            # recursively fetch children of any block with children
+            if block.get("has_children") and block["type"] != "child_page":
+                try:
+                    pages.extend(get_all_pages(block["id"]))
+                except Exception:
+                    pass
+
+        if not response.get("has_more"):
             break
 
-    return blocks
+        response = notion.blocks.children.list(
+            block_id=block_id,
+            start_cursor=response["next_cursor"]
+        )
+        time.sleep(0.2)
+
+    return pages
 
 
-def get_page_info(page):
-    props = page.get("properties", {})
-    title_prop = props.get("title") or props.get("Name")
+# ============================================
+# Slack message
+# ============================================
 
-    if title_prop and title_prop.get("title"):
-        title = "".join(t["plain_text"] for t in title_prop["title"])
-    else:
-        title = "(untitled)"
+def send_to_slack(old_pages):
+    if not SLACK_WEBHOOK_URL:
+        print("No Slack webhook configured")
+        return
 
-    last_raw = page["last_edited_time"].replace("Z", "+00:00")
-    last_edited = datetime.fromisoformat(last_raw).astimezone(timezone.utc)
-
-    url = f"https://notion.so/{page['id'].replace('-', '')}"
-
-    return title, last_edited, url
-
-
-def scan(container_id, out_list):
-    children = get_block_children(container_id)
-
-    for block in children:
-        t = block["type"]
-
-        # Child page
-        if t == "child_page":
-            p = safe_request(notion.pages.retrieve, block["id"])
-            out_list.append(p)
-            scan(block["id"], out_list)
-
-        # Any container block
-        if block.get("has_children") and t != "child_page":
-            scan(block["id"], out_list)
-
-
-# ========================
-# SLACK WEBHOOK MESSAGE
-# ========================
-
-def send_slack_message(old_pages):
     total = len(old_pages)
 
     if total == 0:
-        text = (
-            f"🎉 *Отчёт Notion*\n"
-            f"Нет страниц, которые не редактировались больше года! Все страницы свежие 🌱"
-        )
-    else:
-        # Показываем только первые 20, чтобы Slack не обрезал сообщение
-        top = old_pages[:20]
+        payload = {
+            "text": "🎉 Нет страниц, которые не редактировались больше года!"
+        }
+        requests.post(SLACK_WEBHOOK_URL, json=payload)
+        print("Sent Slack message: 0 pages")
+        return
 
-        rows = "\n".join(
-            f"- *{p['title']}* — `{p['last_edited']}`" for p in top
-        )
+    # show max 20 items
+    top_pages = old_pages[:20]
 
-        if total > 20:
-            rows += f"\n… и ещё *{total - 20}* страниц"
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"📄 *Найдено {total} страниц, которые не редактировались больше года*"
+            }
+        },
+        {"type": "divider"}
+    ]
 
-        text = (
-            f"📄 *Отчёт Notion*\n"
-            f"Найдено *{total}* страниц, которые не редактировали больше года.\n\n"
-            f"*Старейшие страницы:*\n{rows}"
-        )
+    for page in top_pages:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*<{page['url']}|{page['title']}>*\n🕒 Последняя правка: `{page['last_edited']}`"
+            }
+        })
 
-    payload = {"text": text}
+    if total > 20:
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"… и ещё *{total - 20}* страниц"}
+        })
 
-    resp = requests.post(SLACK_WEBHOOK_URL, json=payload)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Slack webhook failed: {resp.text}")
+    payload = {"blocks": blocks}
 
-    print("Slack message sent ✔")
+    try:
+        response = requests.post(SLACK_WEBHOOK_URL, json=payload)
+        response.raise_for_status()
+        print("Posted report to Slack")
+    except Exception as e:
+        print(f"Failed to post to Slack: {e}")
 
 
-# ========================
+# ============================================
 # MAIN
-# ========================
+# ============================================
 
 def main():
-    print("Scanning Notion recursively…")
+    print("Fetching pages recursively...")
+    pages = get_all_pages(ROOT_PAGE_ID)
 
-    pages = []
-    scan(ROOT_PAGE_ID, pages)
+    print(f"Total found: {len(pages)}")
 
-    print(f"Found pages: {len(pages)}")
-
+    # Filter old pages
     old_pages = []
-
     for p in pages:
-        title, last_edit, url = get_page_info(p)
+        if not p["last_edited"]:
+            continue
+        if p["last_edited"] < ONE_YEAR_AGO:
+            p["last_edited"] = p["last_edited"].isoformat()
+            old_pages.append(p)
 
-        if last_edit < ONE_YEAR_AGO:
-            old_pages.append({
-                "title": title,
-                "last_edited": last_edit.isoformat(),
-                "url": url
-            })
-
-        time.sleep(0.05)
-
+    # Sort oldest first
     old_pages.sort(key=lambda x: x["last_edited"])
 
     print(f"Old pages: {len(old_pages)}")
 
-    # Save CSV (GitHub artifact)
-    with open("notion_old_pages.csv", "w", newline="", encoding="utf-8") as f:
+    # Save CSV (artifact)
+    with open("notion_old_pages.csv", "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["title", "last_edited", "url"])
-        for r in old_pages:
-            w.writerow([r["title"], r["last_edited"], r["url"]])
+        for p in old_pages:
+            w.writerow([p["title"], p["last_edited"], p["url"]])
 
-    print("CSV saved (local)")
+    print("CSV saved → notion_old_pages.csv")
 
-    send_slack_message(old_pages)
+    # Slack report
+    send_to_slack(old_pages)
 
 
 if __name__ == "__main__":
