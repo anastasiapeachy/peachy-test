@@ -12,7 +12,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--artifact-url", default=None)
 args = parser.parse_args()
 
-ARTIFACT_URL = args.artifact_url  # not used for upload but kept for consistency
+ARTIFACT_URL = args.artifact_url
 
 # ===== Environment =====
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
@@ -36,7 +36,6 @@ def notion_url(page_id):
 def get_page_info(page_id):
     page = notion.pages.retrieve(page_id=page_id)
 
-    # Extract title
     title = "Untitled"
     if "properties" in page:
         for prop in page["properties"].values():
@@ -44,7 +43,6 @@ def get_page_info(page_id):
                 title = prop["title"][0]["plain_text"]
                 break
 
-    # Last edited
     last_raw = page.get("last_edited_time", "")
     last_dt = datetime.fromisoformat(last_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
 
@@ -57,7 +55,7 @@ def get_page_info(page_id):
 
 
 # ======================================================
-# ⭐⭐⭐ ТВОЯ РАБОЧАЯ РЕКУРСИЯ (full deep scan)
+# ⭐⭐⭐ ТВОЯ РЕАЛЬНАЯ РАБОЧАЯ РЕКУРСИЯ — полный обход Notion
 # ======================================================
 
 def get_all_pages(block_id):
@@ -80,23 +78,19 @@ def get_all_pages(block_id):
                 except Exception:
                     pass
 
-            # 2) Notion иногда скрывает подстраницы внутри:
-            #    column, lists, toggle, synced_block...
-            #    поэтому рекурсивно заходим ВСЕГДА
+            # 2) блоки с has_children → всегда внутрь
             if block.get("has_children", False):
                 try:
                     pages.extend(get_all_pages(block["id"]))
                 except Exception:
                     pass
 
-            # 3) 💥 КРИТИЧЕСКОЕ ДОПОЛНЕНИЕ:
-            #    даже если has_children=False — вложенные страницы МОГУТ быть внутри
+            # 3) 💥 Важнейший блок: глубоко сканируем даже если has_children=False
             if btype in [
                 "column", "column_list",
                 "bulleted_list_item", "numbered_list_item",
-                "toggle", "to_do",
-                "synced_block", "paragraph",
-                "quote", "callout"
+                "toggle", "to_do", "synced_block",
+                "paragraph", "quote", "callout"
             ]:
                 try:
                     pages.extend(get_all_pages(block["id"]))
@@ -113,36 +107,65 @@ def get_all_pages(block_id):
 
 
 # ======================================================
-# Slack file upload (file + comment)
+# Slack: upload via files.remote.add + remote.share + chat.postMessage
 # ======================================================
 
 def upload_file_to_slack(filepath, message):
-    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL:
+    bot_token = SLACK_BOT_TOKEN
+    channel = SLACK_CHANNEL
+    artifact_url = ARTIFACT_URL  # GitHub ZIP URL
+
+    if not bot_token or not channel:
         print("Slack bot token or channel missing.")
         return
 
-    print("Uploading CSV to Slack (V2 API)...")
+    print("Uploading file to Slack via files.remote.add ...")
 
-    with open(filepath, "rb") as f:
-        response = requests.post(
-            "https://slack.com/api/files.uploadV2",
-            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-            data={
-                "channels": SLACK_CHANNEL,
-                "filename": os.path.basename(filepath),
-                "title": message,
-            },
-            files={"file": f}
-        )
+    # 1) Добавляем удалённый файл
+    remote = requests.post(
+        "https://slack.com/api/files.remote.add",
+        headers={"Authorization": f"Bearer {bot_token}"},
+        data={
+            "external_id": "notion-old-pages-file",
+            "title": "Notion Old Pages CSV",
+            "filetype": "csv",
+            "external_url": artifact_url,
+        }
+    )
 
-    print("Slack upload status:", response.status_code)
-    print("Slack response:", response.text)
+    print("remote.add:", remote.status_code, remote.text)
+    j = remote.json()
+    if not j.get("ok"):
+        raise Exception(f"Slack remote.add error: {j.get('error')}")
 
-    response.raise_for_status()
+    file_id = j["file"]["id"]
 
-    data = response.json()
-    if not data.get("ok"):
-        raise Exception(f"Slack error: {data.get('error')}")
+    # 2) Делаем видимым в нужном канале
+    share = requests.post(
+        "https://slack.com/api/files.remote.share",
+        headers={"Authorization": f"Bearer {bot_token}"},
+        data={"file": file_id, "channels": channel}
+    )
+
+    print("remote.share:", share.status_code, share.text)
+    s = share.json()
+    if not s.get("ok"):
+        raise Exception(f"Slack share error: {s.get('error')}")
+
+    # 3) Отправляем сообщение в канал
+    msg = requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers={"Authorization": f"Bearer {bot_token}", "Content-type": "application/json"},
+        json={
+            "channel": channel,
+            "text": message
+        }
+    )
+
+    print("postMessage:", msg.status_code, msg.text)
+    m = msg.json()
+    if not m.get("ok"):
+        raise Exception(f"Slack message error: {m.get('error')}")
 
 
 # ======================================================
@@ -167,7 +190,6 @@ def generate_csv_and_count():
     old_pages.sort(key=lambda x: x["last_edited"])
     print(f"Old pages found: {len(old_pages)}")
 
-    # Save CSV
     with open("notion_old_pages.csv", "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["title", "last_edited", "url"])
@@ -181,7 +203,7 @@ def generate_csv_and_count():
 
 
 # ======================================================
-# Phase 2 — Slack notification with file
+# Phase 2 — Slack notification
 # ======================================================
 
 def notify_slack():
