@@ -8,11 +8,10 @@ import json
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
-SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-SLACK_CHANNEL = os.getenv("SLACK_CHANNEL")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+ARTIFACT_URL = os.getenv("ARTIFACT_URL")  # появляется при втором запуске
 
 notion = Client(auth=NOTION_TOKEN)
-
 ONE_YEAR_AGO = datetime.now(timezone.utc) - timedelta(days=365)
 
 
@@ -80,69 +79,73 @@ def get_all_pages(block_id):
 
 
 # ============================================
-# Slack – FILE UPLOAD
+# Slack message
 # ============================================
 
-def slack_upload_csv(filepath, total_count):
-    print("Uploading CSV to Slack...")
+def send_slack_message(total_count, artifact_url):
+    if not SLACK_WEBHOOK_URL:
+        print("No Slack webhook configured.")
+        return
 
-    url = "https://slack.com/api/files.upload"
-    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
-
-    comment_text = f"📄 Найдено *{total_count}* страниц, которые не редактировались больше года."
-
-    with open(filepath, "rb") as f:
-        response = requests.post(
-            url,
-            headers=headers,
-            data={
-                "channels": SLACK_CHANNEL,
-                "initial_comment": comment_text,
-                "title": "notion_old_pages.csv",
-            },
-            files={"file": f},
+    payload = {
+        "text": (
+            f"📄 Найдено *{total_count}* страниц, которые не редактировались больше года.\n"
+            f"📎 Скачать CSV: {artifact_url}"
         )
+    }
 
-    print("Slack upload status:", response.status_code)
-    print("Slack upload response:", response.text)
-
-    if not response.json().get("ok"):
-        raise RuntimeError(f"Slack upload failed: {response.text}")
+    print("Sending Slack message...")
+    r = requests.post(SLACK_WEBHOOK_URL, json=payload)
+    print("Slack status:", r.status_code)
+    print(r.text)
+    r.raise_for_status()
 
 
 # ============================================
-# MAIN
+# MAIN mode 1: generate CSV
+# MAIN mode 2: post Slack message (if ARTIFACT_URL is set)
 # ============================================
 
 def main():
+    # Mode 2 — send Slack message
+    if ARTIFACT_URL:
+        with open("notion_old_pages_count.json", "r") as f:
+            total = json.load(f)["count"]
+
+        send_slack_message(total, ARTIFACT_URL)
+        return
+
+    # Mode 1 — generate CSV + save count
     print("Fetching pages recursively...")
     pages = get_all_pages(ROOT_PAGE_ID)
-
     print(f"Total found: {len(pages)}")
 
-    old_pages = []
-
-    for p in pages:
-        if p["last_edited"] < ONE_YEAR_AGO:
-            p["last_edited"] = p["last_edited"].isoformat()
-            old_pages.append(p)
+    old_pages = [
+        {
+            "title": p["title"],
+            "last_edited": p["last_edited"].isoformat(),
+            "url": p["url"],
+        }
+        for p in pages
+        if p["last_edited"] < ONE_YEAR_AGO
+    ]
 
     old_pages.sort(key=lambda x: x["last_edited"])
-
     print(f"Old pages: {len(old_pages)}")
 
-    # Create CSV
+    # Save CSV
     csv_path = "notion_old_pages.csv"
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["title", "last_edited", "url"])
-
         for p in old_pages:
             w.writerow([p["title"], p["last_edited"], p["url"]])
 
     print("CSV saved")
 
-    slack_upload_csv(csv_path, len(old_pages))
+    # save count for phase 2
+    with open("notion_old_pages_count.json", "w") as f:
+        json.dump({"count": len(old_pages)}, f)
 
 
 if __name__ == "__main__":
