@@ -14,6 +14,7 @@ jobs:
     outputs:
       total_pages: ${{ steps.collect.outputs.total_pages }}
       batches: ${{ steps.collect.outputs.batches }}
+      batch_list: ${{ steps.collect.outputs.batch_list }}
 
     steps:
       - uses: actions/checkout@v4
@@ -32,12 +33,11 @@ jobs:
         run: |
           python <<EOF
           from notion_client import Client
-          import os, math
+          import os, math, json
 
           notion = Client(auth=os.environ["NOTION_TOKEN"])
           root = os.environ["ROOT_PAGE_ID"]
 
-          # Count pages under root
           def normalize_id(x): return x.replace("-", "")
 
           def get_all_pages():
@@ -58,7 +58,6 @@ jobs:
           pages = get_all_pages()
           root = normalize_id(root)
 
-          # Only direct descendants
           def is_child(p):
               parent = p.get("parent", {})
               if parent.get("type") == "page_id":
@@ -70,19 +69,21 @@ jobs:
           batch_size = int(os.environ["BATCH_SIZE"])
           batches = math.ceil(total / batch_size)
 
+          batch_list = list(range(batches))   # [0,1,2,3...]
+
           print(f"::set-output name=total_pages::{total}")
           print(f"::set-output name=batches::{batches}")
-          print(f"FOUND {total} pages → {batches} batches")
+          print(f"::set-output name=batch_list::{json.dumps(batch_list)}")
           EOF
 
 
   run-batches:
     needs: collect-metadata
     runs-on: ubuntu-latest
+
     strategy:
       matrix:
-        batch: ${{ fromJson(needs.collect-metadata.outputs.batches) | split(',') }}
-      max-parallel: 1
+        batch: ${{ fromJson(needs.collect-metadata.outputs.batch_list) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -130,15 +131,14 @@ jobs:
           python <<EOF
           import os, csv
 
-          merged = []
-          header_written = False
-
           with open("notion_language_full_report.csv", "w", newline="", encoding="utf-8") as out_file:
               writer = None
 
               for root, dirs, files in os.walk("results"):
                   for file in files:
-                      if not file.endswith(".csv"): continue
+                      if not file.endswith(".csv"):
+                          continue
+
                       path = os.path.join(root, file)
                       with open(path, encoding="utf-8") as f:
                           reader = csv.DictReader(f)
