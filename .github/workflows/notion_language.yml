@@ -2,34 +2,45 @@ name: Notion Language Check
 
 on:
   workflow_dispatch:
+    inputs:
+      batch_index:
+        description: "Batch index (0 = first batch)"
+        required: true
+        default: "0"
+      batch_size:
+        description: "Batch size (pages per run)"
+        required: true
+        default: "20"
 
 jobs:
   run-check:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install notion-client langdetect
+          pip install notion-client langdetect requests
 
-      - name: Run language check
+      - name: Run Notion Language Check
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          BATCH_INDEX: ${{ github.event.inputs.batch_index }}
+          BATCH_SIZE: ${{ github.event.inputs.batch_size }}
         run: |
           python notion_language_check.py
 
-      - name: Upload CSV artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload CSV Result
+        uses: actions/upload-artifact@v3
         with:
-          name: notion-language-report
+          name: notion_language_report
           path: notion_language_percentages.csv
