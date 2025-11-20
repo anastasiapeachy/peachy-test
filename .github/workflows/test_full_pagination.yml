@@ -1,10 +1,10 @@
-name: Test Notion Columns
+name: Test Notion Column Pagination
 
 on:
   workflow_dispatch:
 
 jobs:
-  run-test:
+  test-columns:
     runs-on: ubuntu-latest
 
     steps:
@@ -14,14 +14,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           pip install notion-client
 
-      - name: Run test
+      - name: Run pagination test
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
         run: |
-          python test_columns.py
+          python test_full_pagination.py
