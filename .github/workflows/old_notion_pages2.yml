@@ -21,13 +21,12 @@ jobs:
           pip install notion-client==2.2.1
           pip install requests
 
-      # Phase 1
+      # Phase 1 — get pages + generate CSV
       - name: Run Notion Analyzer
         run: python notion_old_page_monitor.py
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
 
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
@@ -36,7 +35,7 @@ jobs:
           name: notion-old-pages
           path: notion_old_pages.csv
 
-      - name: Get Artifact URL
+      - name: Get Artifact URL (not used by Slack upload but required for script flow)
         id: artifact_url
         uses: actions/github-script@v7
         with:
@@ -50,8 +49,9 @@ jobs:
             const artifact = artifacts.data.artifacts.find(a => a.name === "notion-old-pages");
             return `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/artifacts/${artifact.id}`;
 
-      # Phase 2 — send Slack notification
+      # Phase 2 — Slack upload (file)
       - name: Send Slack notification
         run: python notion_old_page_monitor.py --artifact-url "${{ steps.artifact_url.outputs.result }}"
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
