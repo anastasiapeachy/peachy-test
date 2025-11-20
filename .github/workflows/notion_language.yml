@@ -1,47 +1,157 @@
-name: Notion Language Check
+name: Notion Language Full Scan
 
 on:
   workflow_dispatch:
     inputs:
-      batch_index:
-        description: "Batch index (0 = first batch)"
-        required: true
-        default: "0"
       batch_size:
-        description: "Batch size (pages per run)"
+        description: "Pages per batch"
         required: true
         default: "20"
 
 jobs:
-  run-check:
+  collect-metadata:
     runs-on: ubuntu-latest
+    outputs:
+      total_pages: ${{ steps.collect.outputs.total_pages }}
+      batches: ${{ steps.collect.outputs.batches }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          pip install notion-client langdetect requests
+      - run: pip install notion-client
 
-      - name: Run Notion Language Check
+      - id: collect
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+          BATCH_SIZE: ${{ github.event.inputs.batch_size }}
+        run: |
+          python <<EOF
+          from notion_client import Client
+          import os, math
+
+          notion = Client(auth=os.environ["NOTION_TOKEN"])
+          root = os.environ["ROOT_PAGE_ID"]
+
+          # Count pages under root
+          def normalize_id(x): return x.replace("-", "")
+
+          def get_all_pages():
+              pages = []
+              cursor = None
+              while True:
+                  r = notion.search(
+                      query="",
+                      filter={"value": "page", "property": "object"},
+                      start_cursor=cursor
+                  )
+                  pages.extend(r["results"])
+                  if not r["has_more"]:
+                      break
+                  cursor = r["next_cursor"]
+              return pages
+
+          pages = get_all_pages()
+          root = normalize_id(root)
+
+          # Only direct descendants
+          def is_child(p):
+              parent = p.get("parent", {})
+              if parent.get("type") == "page_id":
+                  return normalize_id(parent["page_id"]) == root
+              return False
+
+          selected = [p for p in pages if is_child(p)]
+          total = len(selected)
+          batch_size = int(os.environ["BATCH_SIZE"])
+          batches = math.ceil(total / batch_size)
+
+          print(f"::set-output name=total_pages::{total}")
+          print(f"::set-output name=batches::{batches}")
+          print(f"FOUND {total} pages → {batches} batches")
+          EOF
+
+
+  run-batches:
+    needs: collect-metadata
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        batch: ${{ fromJson(needs.collect-metadata.outputs.batches) | split(',') }}
+      max-parallel: 1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install notion-client langdetect requests
+
+      - name: Run batch script
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          BATCH_INDEX: ${{ github.event.inputs.batch_index }}
+          BATCH_INDEX: ${{ matrix.batch }}
           BATCH_SIZE: ${{ github.event.inputs.batch_size }}
-        run: |
-          python notion_language_check.py
+        run: python notion_language_check.py
 
-      - name: Upload CSV Result
+      - name: Upload batch artifact
         uses: actions/upload-artifact@v4
         with:
-          name: batch_${{ github.event.inputs.batch_index }}_report
+          name: batch_${{ matrix.batch }}
           path: notion_language_percentages.csv
+          retention-days: 30
+
+
+  merge-reports:
+    needs: run-batches
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download all batch CSVs
+        uses: actions/download-artifact@v4
+        with:
+          path: results
+
+      - run: |
+          python <<EOF
+          import os, csv
+
+          merged = []
+          header_written = False
+
+          with open("notion_language_full_report.csv", "w", newline="", encoding="utf-8") as out_file:
+              writer = None
+
+              for root, dirs, files in os.walk("results"):
+                  for file in files:
+                      if not file.endswith(".csv"): continue
+                      path = os.path.join(root, file)
+                      with open(path, encoding="utf-8") as f:
+                          reader = csv.DictReader(f)
+                          if writer is None:
+                              writer = csv.DictWriter(out_file, fieldnames=reader.fieldnames)
+                              writer.writeheader()
+                          for row in reader:
+                              writer.writerow(row)
+          EOF
+
+      - name: Upload final merged CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: final_report
+          path: notion_language_full_report.csv
           retention-days: 30
