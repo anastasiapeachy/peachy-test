@@ -21,22 +21,22 @@ jobs:
           pip install notion-client==2.2.1
           pip install requests
 
-      # Phase 1 — generate CSV + count
+      # Phase 1 — generate CSV & count
       - name: Run Notion Analyzer
         run: python notion_old_page_monitor.py
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
 
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
-        id: upload
+        id: up
         with:
           name: notion-old-pages
           path: notion_old_pages.csv
 
-      - name: Extract artifact URL
+      - name: Get Artifact URL
         id: artifact_url
         uses: actions/github-script@v7
         with:
@@ -52,7 +52,6 @@ jobs:
 
       # Phase 2 — send Slack message
       - name: Send Slack notification
-        run: python notion_old_page_monitor.py
+        run: python notion_old_page_monitor.py --artifact-url "${{ steps.artifact_url.outputs.result }}"
         env:
-          ARTIFACT_URL: ${{ steps.artifact_url.outputs.result }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
