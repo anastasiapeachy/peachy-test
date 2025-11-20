@@ -21,7 +21,7 @@ jobs:
           pip install notion-client==2.2.1
           pip install requests
 
-      # Phase 1 — generate CSV & count
+      # Phase 1
       - name: Run Notion Analyzer
         run: python notion_old_page_monitor.py
         env:
@@ -50,7 +50,7 @@ jobs:
             const artifact = artifacts.data.artifacts.find(a => a.name === "notion-old-pages");
             return `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/artifacts/${artifact.id}`;
 
-      # Phase 2 — send Slack message
+      # Phase 2 — send Slack notification
       - name: Send Slack notification
         run: python notion_old_page_monitor.py --artifact-url "${{ steps.artifact_url.outputs.result }}"
         env:
