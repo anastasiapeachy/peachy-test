@@ -27,7 +27,7 @@ jobs:
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
           SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}   # не используется webhook-ом, но можно оставить
         run: python notion_old_page_monitor.py
 
