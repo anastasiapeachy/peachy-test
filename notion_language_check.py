@@ -49,59 +49,73 @@ def get_children(block_id):
 # ===============================================================
 # FULL TEXT EXTRACTOR (column_list, column, table, synced_block, nested)
 # ===============================================================
-def extract_text(block):
+def extract_page_mentions(block):
+    """Return list of page IDs found inside rich_text → mention."""
+    pages = []
+
     btype = block.get("type")
-    txt = []
+    payload = block.get(btype, {}) or {}
 
-    content = block.get(btype, {}) or {}
+    # 1) rich_text fields
+    if "rich_text" in payload:
+        for rt in payload["rich_text"]:
+            if rt.get("type") == "mention":
+                mention = rt.get("mention", {})
+                if mention.get("type") == "page":
+                    pid = mention["page"]["id"]
+                    pages.append(clean_id(pid))
 
-    # 1 rich_text
-    rt = content.get("rich_text")
-    if rt:
-        for t in rt:
-            if "plain_text" in t:
-                txt.append(t["plain_text"])
+    # 2) captions can also contain mentions
+    if "caption" in payload:
+        for rt in payload["caption"]:
+            if rt.get("type") == "mention":
+                mention = rt.get("mention", {})
+                if mention.get("type") == "page":
+                    pid = mention["page"]["id"]
+                    pages.append(clean_id(pid))
 
-    # 2 caption
-    cap = content.get("caption")
-    if cap:
-        for t in cap:
-            if "plain_text" in t:
-                txt.append(t["plain_text"])
+    return pages
 
-    # 3 table row
-    if btype == "table_row":
-        for cell in content.get("cells", []):
-            for t in cell:
-                if "plain_text" in t:
-                    txt.append(t["plain_text"])
 
-    # 4 equation
-    if btype == "equation":
-        expr = content.get("expression")
-        if expr:
-            txt.append(expr)
+def get_all_subpages(root_id):
+    """Find ALL child pages under root, including pages hidden inside lists/columns."""
+    found = set()
+    queue = [root_id]
 
-    # 5 synced_block
-    if btype == "synced_block":
-        synced_from = content.get("synced_from")
-        if synced_from and synced_from.get("block_id"):
-            orig = synced_from["block_id"]
-            for ch in get_children(orig):
-                txt.append(extract_text(ch))
+    while queue:
+        current = queue.pop()
 
-    # 6 column / column_list (just go inside children)
-    if btype in ("column_list", "column"):
-        for ch in get_children(block["id"]):
-            txt.append(extract_text(ch))
+        for block in get_children(current):
+            btype = block.get("type")
 
-    # 7 other nested children
-    if block.get("has_children"):
-        for ch in get_children(block["id"]):
-            txt.append(extract_text(ch))
+            # --- case 1: real child_page block ---
+            if btype == "child_page":
+                pid = clean_id(block["id"])
+                if pid not in found:
+                    found.add(pid)
+                    queue.append(pid)
 
-    # join
-    return "\n".join(t for t in txt if t).strip()
+            # --- case 2: page mentions inside rich_text ---
+            for pid in extract_page_mentions(block):
+                if pid not in found:
+                    # MUST validate it is actually child of root (strict chain)
+                    try:
+                        parent = notion.pages.retrieve(page_id=pid)["parent"]
+                        if parent.get("type") == "page_id":
+                            if clean_id(parent["page_id"]) == current:
+                                found.add(pid)
+                                queue.append(pid)
+                    except:
+                        pass
+
+            # --- case 3: go deeper into children ---
+            if block.get("has_children"):
+                queue.append(clean_id(block["id"]))
+
+    # remove root itself
+    found.discard(clean_id(root_id))
+
+    return list(found)
 
 
 # ===============================================================
