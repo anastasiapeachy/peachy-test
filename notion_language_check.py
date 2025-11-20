@@ -1,256 +1,254 @@
 import os
-import re
 import csv
+import re
 import time
-import json
-import math
 from notion_client import Client
 from langdetect import detect
 
-# ------------------------------------------
-# ENV
-# ------------------------------------------
+# ===== Env =====
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
 
 if not NOTION_TOKEN or not ROOT_PAGE_ID:
-    raise ValueError("Missing env vars NOTION_TOKEN or ROOT_PAGE_ID")
+    raise ValueError("Missing NOTION_TOKEN or ROOT_PAGE_ID env vars")
 
 notion = Client(auth=NOTION_TOKEN)
 
 
-def clean_id(raw):
-    raw = raw.replace("-", "")
-    if len(raw) == 32:
-        return raw
-    m = re.search(r"([0-9a-fA-F]{32})", raw)
-    return m.group(1) if m else raw
+# ================================
+# Helpers
+# ================================
+
+def normalize_id(i):
+    return i.replace("-", "").strip()
 
 
-ROOT_PAGE_ID = clean_id(ROOT_PAGE_ID)
+ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
 
 
-# ===============================================================
-# BLOCK FETCHING (pagination-safe)
-# ===============================================================
-def get_children(block_id):
-    out = []
-    cursor = None
-    while True:
-        resp = notion.blocks.children.list(block_id=block_id, start_cursor=cursor)
-        out.extend(resp["results"])
-        cursor = resp.get("next_cursor")
-        if not cursor:
-            break
-        time.sleep(0.1)
-    return out
+def notion_url(pid):
+    clean = pid.replace("-", "")
+    return f"https://www.notion.so/{clean}"
 
 
-# ===============================================================
-# FULL TEXT EXTRACTOR (column_list, column, table, synced_block, nested)
-# ===============================================================
-def extract_page_mentions(block):
-    """Return list of page IDs found inside rich_text → mention."""
-    pages = []
+def count_words(text):
+    return len(re.findall(r"\b\w+\b", text))
 
+
+# ================================
+#  FULL RECURSIVE TEXT EXTRACTION
+# ================================
+
+def extract_text_from_block(block):
+    """Extract ALL text from block (rich_text, children, columns, tables, synced blocks)."""
+    results = []
     btype = block.get("type")
-    payload = block.get(btype, {}) or {}
+    data = block.get(btype, {}) if btype else {}
 
-    # 1) rich_text fields
-    if "rich_text" in payload:
-        for rt in payload["rich_text"]:
-            if rt.get("type") == "mention":
-                mention = rt.get("mention", {})
-                if mention.get("type") == "page":
-                    pid = mention["page"]["id"]
-                    pages.append(clean_id(pid))
+    # --- 1) rich_text ---
+    if isinstance(data, dict) and "rich_text" in data:
+        rt = data["rich_text"]
+        if isinstance(rt, list):
+            for t in rt:
+                if t.get("plain_text"):
+                    results.append(t["plain_text"])
 
-    # 2) captions can also contain mentions
-    if "caption" in payload:
-        for rt in payload["caption"]:
-            if rt.get("type") == "mention":
-                mention = rt.get("mention", {})
-                if mention.get("type") == "page":
-                    pid = mention["page"]["id"]
-                    pages.append(clean_id(pid))
+    # --- 2) captions ---
+    if isinstance(data, dict) and "caption" in data:
+        cap = data["caption"]
+        if isinstance(cap, list):
+            for t in cap:
+                if t.get("plain_text"):
+                    results.append(t["plain_text"])
 
-    return pages
+    # --- 3) equation ---
+    if btype == "equation":
+        expr = data.get("expression")
+        if expr:
+            results.append(expr)
 
+    # --- 4) table rows ---
+    if btype == "table":
+        try:
+            rows = notion.blocks.children.list(block["id"])["results"]
+            for row in rows:
+                if row.get("type") == "table_row":
+                    cells = row["table_row"]["cells"]
+                    for cell in cells:
+                        for t in cell:
+                            if t.get("plain_text"):
+                                results.append(t["plain_text"])
+        except:
+            pass
 
-def get_all_subpages(root_id):
-    """Find ALL child pages under root, including pages hidden inside lists/columns."""
-    found = set()
-    queue = [root_id]
+    # --- 5) column_list / column FIX ---
+    if btype in ("column_list", "column"):
+        try:
+            children = notion.blocks.children.list(block["id"])["results"]
+            for child in children:
+                results.append(extract_text_from_block(child))
+        except:
+            pass
+        return " ".join(r for r in results if r).strip()
 
-    while queue:
-        current = queue.pop()
-
-        for block in get_children(current):
-            btype = block.get("type")
-
-            # --- case 1: real child_page block ---
-            if btype == "child_page":
-                pid = clean_id(block["id"])
-                if pid not in found:
-                    found.add(pid)
-                    queue.append(pid)
-
-            # --- case 2: page mentions inside rich_text ---
-            for pid in extract_page_mentions(block):
-                if pid not in found:
-                    # MUST validate it is actually child of root (strict chain)
-                    try:
-                        parent = notion.pages.retrieve(page_id=pid)["parent"]
-                        if parent.get("type") == "page_id":
-                            if clean_id(parent["page_id"]) == current:
-                                found.add(pid)
-                                queue.append(pid)
-                    except:
-                        pass
-
-            # --- case 3: go deeper into children ---
-            if block.get("has_children"):
-                queue.append(clean_id(block["id"]))
-
-    # remove root itself
-    found.discard(clean_id(root_id))
-
-    return list(found)
-
-
-# ===============================================================
-# GET TEXT OF ENTIRE PAGE
-# ===============================================================
-def get_page_text(page_id):
-    blocks = get_children(page_id)
-    parts = []
-    for b in blocks:
-        parts.append(extract_text(b))
-    return "\n".join(p for p in parts if p).strip()
-
-
-# ===============================================================
-# DETECT LANGUAGE
-# ===============================================================
-def count_lang(text):
-    words_total = len(re.findall(r'\b\w+\b', text))
-    if words_total == 0:
-        return 0, 0
-
-    lang = "unknown"
-    try:
-        lang = detect(text)
-    except:
-        pass
-
-    if lang == "ru":
-        return words_total, 0
-    if lang == "en":
-        return 0, words_total
-    return 0, 0
-
-
-# ===============================================================
-# FIND ALL PAGES UNDER ROOT
-# ===============================================================
-def get_direct_children_pages(pid):
-    out = []
-    for b in get_children(pid):
-        if b["type"] == "child_page":
-            out.append(clean_id(b["id"]))
-    return out
-
-
-def get_all_subpages(root_id):
-    result = []
-    stack = [root_id]
-    visited = set()
-
-    while stack:
-        pid = stack.pop()
-        if pid in visited:
-            continue
-        visited.add(pid)
-
-        children = get_direct_children_pages(pid)
-        result.extend(children)
-        stack.extend(children)
-
-    return list(dict.fromkeys(result))  # remove duplicates
-
-
-# ===============================================================
-# MAIN BATCH PROCESS
-# ===============================================================
-def main():
-    pages = get_all_subpages(ROOT_PAGE_ID)
-    pages = [p for p in pages if p != ROOT_PAGE_ID]
-
-    print(f"Total pages under root: {len(pages)}")
-
-    batch_size = 20
-    batches = [pages[i:i+batch_size] for i in range(0, len(pages), batch_size)]
-
-    all_rows = []
-
-    for bi, batch in enumerate(batches, start=1):
-        print(f"Processing batch {bi}/{len(batches)} with {len(batch)} pages")
-
-        for pid in batch:
-            try:
-                page = notion.pages.retrieve(page_id=pid)
-            except:
-                print("Skip page, access denied:", pid)
-                continue
-
-            # title
-            title = "(untitled)"
-            for prop in page.get("properties", {}).values():
-                if prop.get("type") == "title" and prop.get("title"):
-                    title = prop["title"][0]["plain_text"]
-                    break
-
-            # author
-            author = "(unknown)"
-            a = page.get("created_by", {})
-            if a.get("name"):
-                author = a["name"]
-            elif a.get("id"):
+    # --- 6) synced_block (real source) ---
+    if btype == "synced_block":
+        synced = data
+        if synced.get("synced_from"):
+            src = synced["synced_from"].get("block_id")
+            if src:
                 try:
-                    u = notion.users.retrieve(user_id=a["id"])
-                    author = u.get("name", "(unknown)")
+                    children = notion.blocks.children.list(src)["results"]
+                    for c in children:
+                        results.append(extract_text_from_block(c))
                 except:
                     pass
 
-            # text
-            text = get_page_text(pid)
-            ru, en = count_lang(text)
+    # --- 7) children blocks recursion ---
+    if block.get("has_children"):
+        try:
+            children = notion.blocks.children.list(block["id"])["results"]
+            for child in children:
+                results.append(extract_text_from_block(child))
+        except:
+            pass
 
-            total = ru + en
-            ru_pct = (ru/total*100) if total else 0
-            en_pct = (en/total*100) if total else 0
+    return " ".join(r for r in results if r).strip()
 
-            all_rows.append({
-                "Page Title": title,
-                "Page URL": f"https://www.notion.so/{pid}",
-                "Author": author,
-                "% Russian": round(ru_pct, 2),
-                "% English": round(en_pct, 2)
-            })
 
-    # sort
-    all_rows.sort(key=lambda x: (x["% English"], x["% Russian"]), reverse=True)
+def get_page_text(page_id):
+    full_text_parts = []
+    cursor = None
 
-    # write CSV
-    with open("notion_language_report.csv", "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=["Page Title", "Page URL", "Author", "% Russian", "% English"]
-        )
-        w.writeheader()
-        w.writerows(all_rows)
+    while True:
+        resp = notion.blocks.children.list(block_id=page_id, start_cursor=cursor)
 
-    print("Saved notion_language_report.csv")
+        for block in resp["results"]:
+            if block["type"] == "child_page":
+                continue
+            txt = extract_text_from_block(block)
+            if txt:
+                full_text_parts.append(txt)
+
+        if not resp.get("has_more"):
+            break
+        cursor = resp["next_cursor"]
+
+    return " ".join(full_text_parts)
+
+
+# ================================
+# STRICT HIERARCHY VALIDATION
+# ================================
+
+def parent_chain(page_id):
+    chain = []
+    cur = notion.pages.retrieve(page_id=page_id)
+    while True:
+        parent = cur.get("parent", {})
+        ptype = parent.get("type")
+        if ptype == "page_id":
+            pid = normalize_id(parent["page_id"])
+            chain.append(pid)
+            if pid == ROOT_PAGE_ID:
+                return chain
+            cur = notion.pages.retrieve(page_id=pid)
+            continue
+        return None  # not allowed
+
+
+def is_child_of_root(page):
+    pid = normalize_id(page["id"])
+    if pid == ROOT_PAGE_ID:
+        return True
+    ch = parent_chain(pid)
+    return ch is not None
+
+
+# ================================
+# MAIN
+# ================================
+
+def analyze_batch(pages):
+    rows = []
+
+    for p in pages:
+        page_id = normalize_id(p["id"])
+        title = get_title(p)
+        url = notion_url(page_id)
+
+        text = get_page_text(page_id)
+        if not text:
+            rows.append((title, url, 0, 0))
+            continue
+
+        try:
+            lang = detect(text)
+        except:
+            lang = "unknown"
+
+        words = count_words(text)
+        if words == 0:
+            rows.append((title, url, 0, 0))
+            continue
+
+        # naive split
+        ru_words = len(re.findall(r"[А-Яа-яЁё]+", text))
+        en_words = len(re.findall(r"[A-Za-z]+", text))
+
+        total = ru_words + en_words
+        if total == 0:
+            ru_pct = en_pct = 0
+        else:
+            ru_pct = ru_words / total * 100
+            en_pct = en_words / total * 100
+
+        rows.append((title, url, round(ru_pct, 2), round(en_pct, 2)))
+
+    return rows
+
+
+def get_title(page):
+    props = page.get("properties", {})
+    for prop in props.values():
+        if prop.get("type") == "title":
+            t = prop.get("title", [])
+            if t:
+                return t[0]["plain_text"]
+    return "(untitled)"
+
+
+def main():
+    # Step 1: search all pages
+    print("Searching all pages…")
+    all_pages = notion.search(
+        filter={"value": "page", "property": "object"},
+        query=""
+    )["results"]
+
+    filtered = [p for p in all_pages if is_child_of_root(p)]
+    print(f"Total pages under root: {len(filtered)}")
+
+    # Step 2: batch into 20
+    batches = [filtered[i:i+20] for i in range(0, len(filtered), 20)]
+
+    all_rows = []
+
+    for idx, batch in enumerate(batches, 1):
+        print(f"Processing batch {idx}/{len(batches)} (size {len(batch)})")
+        rows = analyze_batch(batch)
+        all_rows.extend(rows)
+        time.sleep(0.3)
+
+    # Step 3: write CSV
+    fname = "notion_language_report.csv"
+    with open(fname, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["Title", "URL", "% Russian", "% English"])
+        for r in all_rows:
+            w.writerow(r)
+
+    print(f"\nSaved report: {fname}")
 
 
 if __name__ == "__main__":
