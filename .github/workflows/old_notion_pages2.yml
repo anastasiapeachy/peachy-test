@@ -10,11 +10,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -23,23 +21,22 @@ jobs:
           pip install notion-client==2.2.1
           pip install requests
 
-      - name: Run Notion Monitor
-        id: run_script
+      # Phase 1 — generate CSV + count
+      - name: Run Notion Analyzer
+        run: python notion_old_page_monitor.py
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          python notion_old_page_monitor.py
 
       - name: Upload CSV artifact
-        id: upload_artifact
         uses: actions/upload-artifact@v4
+        id: upload
         with:
           name: notion-old-pages
           path: notion_old_pages.csv
 
-      - name: Generate artifact download URL
+      - name: Extract artifact URL
         id: artifact_url
         uses: actions/github-script@v7
         with:
@@ -50,23 +47,12 @@ jobs:
               repo: context.repo.repo,
               run_id: context.runId
             });
-
             const artifact = artifacts.data.artifacts.find(a => a.name === "notion-old-pages");
-            const download = await github.rest.actions.downloadArtifact({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              artifact_id: artifact.id,
-              archive_format: "zip"
-            });
+            return `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/artifacts/${artifact.id}`;
 
-            // Формируем URL на artifact
-            const url = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/artifacts/${artifact.id}`;
-
-            return url;
-
-      - name: Post Slack message
+      # Phase 2 — send Slack message
+      - name: Send Slack notification
+        run: python notion_old_page_monitor.py
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           ARTIFACT_URL: ${{ steps.artifact_url.outputs.result }}
-        run: |
-          python slack_notify.py
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
