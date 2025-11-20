@@ -121,13 +121,17 @@ def upload_file_to_slack(filepath, message):
         print("Slack bot token or channel missing.")
         return
 
-    print("Uploading CSV to Slack...")
+    print("Uploading CSV to Slack (V2 API)...")
 
     with open(filepath, "rb") as f:
         response = requests.post(
-            "https://slack.com/api/files.upload",
+            "https://slack.com/api/files.uploadV2",
             headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-            data={"channels": SLACK_CHANNEL, "initial_comment": message},
+            data={
+                "channels": SLACK_CHANNEL,
+                "filename": os.path.basename(filepath),
+                "title": message,
+            },
             files={"file": f}
         )
 
