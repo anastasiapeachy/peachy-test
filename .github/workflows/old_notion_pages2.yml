@@ -2,7 +2,7 @@ name: Daily Notion Old Pages Report
 
 on:
   schedule:
-    - cron: "0 9 * * *"   # каждый день в 09:00 UTC
+    - cron: "0 9 * * *"
   workflow_dispatch:
 
 jobs:
@@ -27,8 +27,8 @@ jobs:
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
-          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}   # не используется webhook-ом, но можно оставить
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
         run: python notion_old_page_monitor.py
 
       - name: Upload CSV artifact
