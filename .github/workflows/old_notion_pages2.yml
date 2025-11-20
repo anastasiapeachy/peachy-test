@@ -24,15 +24,49 @@ jobs:
           pip install requests
 
       - name: Run Notion Monitor
+        id: run_script
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
-        run: python notion_old_page_monitor.py
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python notion_old_page_monitor.py
 
       - name: Upload CSV artifact
+        id: upload_artifact
         uses: actions/upload-artifact@v4
         with:
           name: notion-old-pages
           path: notion_old_pages.csv
+
+      - name: Generate artifact download URL
+        id: artifact_url
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId
+            });
+
+            const artifact = artifacts.data.artifacts.find(a => a.name === "notion-old-pages");
+            const download = await github.rest.actions.downloadArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: artifact.id,
+              archive_format: "zip"
+            });
+
+            // Формируем URL на artifact
+            const url = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/artifacts/${artifact.id}`;
+
+            return url;
+
+      - name: Post Slack message
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ARTIFACT_URL: ${{ steps.artifact_url.outputs.result }}
+        run: |
+          python slack_notify.py
