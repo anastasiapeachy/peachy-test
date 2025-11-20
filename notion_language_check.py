@@ -1,178 +1,247 @@
-from notion_client import Client
 import os
-import time
-import requests
-from datetime import datetime, timezone, timedelta
+import re
 import csv
-import json
+import time
+import math
 import argparse
+from notion_client import Client
+from langdetect import detect
+from datetime import datetime
 
-# ===== Args for second-phase Slack run =====
+# ======================
+# ARGUMENTS
+# ======================
 parser = argparse.ArgumentParser()
-parser.add_argument("--artifact-url", default=None)
+parser.add_argument("--batch", type=int, default=None)
+parser.add_argument("--batch-size", type=int, default=20)
 args = parser.parse_args()
-ARTIFACT_URL = args.artifact_url  # (не нужен для метода upload, но оставим для совместимости)
 
-# ===== Env =====
+BATCH_INDEX = args.batch
+BATCH_SIZE = args.batch_size
+
+# ======================
+# ENV VARS
+# ======================
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
-SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-SLACK_CHANNEL = os.getenv("SLACK_CHANNEL")
+
+if not NOTION_TOKEN or not ROOT_PAGE_ID:
+    raise ValueError("Missing NOTION_TOKEN or ROOT_PAGE_ID")
 
 notion = Client(auth=NOTION_TOKEN)
-ONE_YEAR_AGO = datetime.now(timezone.utc) - timedelta(days=365)
-
-# ============================================
-# Helpers
-# ============================================
-
-def notion_url(page_id):
-    clean = page_id.replace("-", "")
-    return f"https://www.notion.so/{clean}"
 
 
-def get_page_info(page_id):
-    page = notion.pages.retrieve(page_id=page_id)
-
-    title = "Untitled"
-    if "properties" in page:
-        for prop in page["properties"].values():
-            if prop["type"] == "title" and prop.get("title"):
-                title = prop["title"][0]["plain_text"]
-                break
-
-    last_raw = page.get("last_edited_time", "")
-    last_dt = datetime.fromisoformat(last_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
-
-    return {
-        "id": page_id,
-        "title": title,
-        "url": notion_url(page_id),
-        "last_edited": last_dt
-    }
+# ======================
+# HELPERS
+# ======================
+def normalize_id(x):
+    if not isinstance(x, str):
+        return x
+    s = x.replace("-", "")
+    if re.fullmatch(r"[0-9a-fA-F]{32}", s):
+        return s
+    m = re.search(r"([0-9a-fA-F]{32})", s)
+    return m.group(1) if m else s
 
 
-# ============================================
-# ⭐⭐ Recursive block traversal (the GOOD one)
-# ============================================
+ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
 
-def get_all_pages(block_id):
+
+def notion_url(pid):
+    return f"https://www.notion.so/{pid.replace('-', '')}"
+
+
+def count_words(text):
+    return len(re.findall(r"\b\w+\b", text))
+
+
+def detect_lang_safe(text):
+    try:
+        return detect(text)
+    except:
+        return "unknown"
+
+
+# ======================
+# FETCH CHILD PAGES
+# strict page → page → root chain
+# ======================
+def get_child_pages_recursive(page_id):
     pages = []
     cursor = None
 
     while True:
-        response = notion.blocks.children.list(block_id=block_id, start_cursor=cursor)
-
-        for block in response["results"]:
-            btype = block["type"]
-
-            # child_page = page
-            if btype == "child_page":
-                pid = block["id"]
-                try:
-                    info = get_page_info(pid)
-                    pages.append(info)
-                    pages.extend(get_all_pages(pid))
-                except Exception as e:
-                    print(f"Skipping page {pid}: {e}")
-
-            # ANY block with children → MUST dive in
+        resp = notion.blocks.children.list(page_id, start_cursor=cursor)
+        for block in resp.get("results", []):
+            if block["type"] == "child_page":
+                pid = normalize_id(block["id"])
+                pages.append(pid)
+                pages.extend(get_child_pages_recursive(pid))
             if block.get("has_children"):
-                try:
-                    pages.extend(get_all_pages(block["id"]))
-                except Exception:
-                    pass
+                pages.extend(get_child_pages_recursive(block["id"]))
 
-        cursor = response.get("next_cursor")
+        cursor = resp.get("next_cursor")
         if not cursor:
             break
-
-        time.sleep(0.15)
-
     return pages
 
 
-# ============================================
-# Slack uploader (file + comment)
-# ============================================
+# ======================
+# RECURSIVE TEXT EXTRACTION
+# this is the FIXED version that correctly handles columns
+# ======================
+def get_text_from_block(block):
 
-def upload_file_to_slack(filepath, message):
-    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL:
-        print("Slack bot token or channel missing.")
+    t = []
+    typ = block["type"]
+    data = block.get(typ, {})
+
+    # ---- FIX: columns ----
+    if typ in ("column_list", "column"):
+        cursor = None
+        while True:
+            resp = notion.blocks.children.list(block["id"], start_cursor=cursor)
+            for ch in resp["results"]:
+                t.append(get_text_from_block(ch))
+            cursor = resp.get("next_cursor")
+            if not cursor:
+                break
+        return " ".join(x for x in t if x)
+
+    # ---- rich_text ----
+    if isinstance(data, dict) and "rich_text" in data:
+        r = " ".join(rt.get("plain_text", "") for rt in data["rich_text"])
+        if r:
+            t.append(r)
+
+    # ---- caption ----
+    if isinstance(data, dict) and "caption" in data:
+        cap = " ".join(c.get("plain_text", "") for c in data["caption"])
+        if cap:
+            t.append(cap)
+
+    # ---- synced_block ----
+    if typ == "synced_block":
+        sf = data.get("synced_from")
+        if sf:
+            original = sf.get("block_id")
+            if original:
+                resp = notion.blocks.children.list(original)
+                for ch in resp["results"]:
+                    t.append(get_text_from_block(ch))
+
+    # ---- table ----
+    if typ == "table":
+        resp = notion.blocks.children.list(block["id"])
+        for row in resp["results"]:
+            if row["type"] == "table_row":
+                for cell in row["table_row"]["cells"]:
+                    part = " ".join(x.get("plain_text", "") for x in cell)
+                    if part:
+                        t.append(part)
+
+    # ---- recurse children ----
+    if block.get("has_children"):
+        cursor = None
+        while True:
+            resp = notion.blocks.children.list(block["id"], start_cursor=cursor)
+            for ch in resp["results"]:
+                t.append(get_text_from_block(ch))
+            cursor = resp.get("next_cursor")
+            if not cursor:
+                break
+
+    return " ".join(x for x in t if x)
+
+
+# ======================
+# PAGE LANGUAGE ANALYSIS
+# ======================
+def analyze_page(page_id):
+
+    ru_words = 0
+    en_words = 0
+
+    blocks = []
+    cursor = None
+    while True:
+        resp = notion.blocks.children.list(page_id, start_cursor=cursor)
+        blocks.extend(resp["results"])
+        cursor = resp.get("next_cursor")
+        if not cursor:
+            break
+
+    for block in blocks:
+        if block["type"] == "child_page":
+            continue
+        text = get_text_from_block(block)
+        if not text.strip():
+            continue
+
+        lang = detect_lang_safe(text)
+        words = count_words(text)
+
+        if lang == "ru":
+            ru_words += words
+        elif lang == "en":
+            en_words += words
+
+    return ru_words, en_words
+
+
+# ======================
+# MAIN (BATCH EXECUTION)
+# ======================
+def main():
+    print("Collecting child pages…")
+    all_pages = list(dict.fromkeys(get_child_pages_recursive(ROOT_PAGE_ID)))
+    total_pages = len(all_pages)
+
+    print(f"Total pages under root: {total_pages}")
+
+    # batching
+    if BATCH_INDEX is None:
+        print("ERROR: batch index is required")
         return
 
-    print("Uploading CSV to Slack...")
+    start = BATCH_INDEX * BATCH_SIZE
+    end = min(start + BATCH_SIZE, total_pages)
+    batch_pages = all_pages[start:end]
 
-    with open(filepath, "rb") as f:
-        response = requests.post(
-            "https://slack.com/api/files.upload",
-            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-            data={"channels": SLACK_CHANNEL, "initial_comment": message},
-            files={"file": f}
-        )
+    print(f"Batch {BATCH_INDEX}: {len(batch_pages)} pages")
 
-    print("Slack upload status:", response.status_code)
-    print("Slack response:", response.text)
+    results = []
 
-    response.raise_for_status()
+    for pid in batch_pages:
+        try:
+            page = notion.pages.retrieve(pid)
+            title = page["properties"]["title"]["title"][0]["plain_text"] \
+                if "title" in page["properties"] else "(untitled)"
+        except:
+            title = "(unknown)"
 
-    data = response.json()
-    if not data.get("ok"):
-        raise Exception(f"Slack error: {data.get('error')}")
+        ru, en = analyze_page(pid)
+        total = ru + en
 
+        ru_pct = round(ru / total * 100, 2) if total else 0
+        en_pct = round(en / total * 100, 2) if total else 0
 
-# ============================================
-# Phase 1 — generate CSV
-# ============================================
+        results.append({
+            "Page": title,
+            "URL": notion_url(pid),
+            "%RU": ru_pct,
+            "%EN": en_pct
+        })
 
-def generate_csv_and_count():
-    print("Fetching pages recursively...")
-    pages = get_all_pages(ROOT_PAGE_ID)
-    print(f"Total found: {len(pages)}")
+    # save batch CSV
+    fname = f"batch_{BATCH_INDEX}.csv"
+    with open(fname, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["Page", "URL", "%RU", "%EN"])
+        w.writeheader()
+        w.writerows(results)
 
-    old_pages = [
-        {
-            "title": p["title"],
-            "last_edited": p["last_edited"].isoformat(),
-            "url": p["url"]
-        }
-        for p in pages
-        if p["last_edited"] < ONE_YEAR_AGO
-    ]
-
-    old_pages.sort(key=lambda x: x["last_edited"])
-    print(f"Old pages: {len(old_pages)}")
-
-    with open("notion_old_pages.csv", "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["title", "last_edited", "url"])
-        for p in old_pages:
-            w.writerow([p["title"], p["last_edited"], p["url"]])
-
-    with open("notion_old_pages_count.json", "w") as f:
-        json.dump({"count": len(old_pages)}, f, ensure_ascii=False)
-
-    print("CSV saved")
+    print(f"Saved {fname}")
 
 
-# ============================================
-# Phase 2 — Slack notification
-# ============================================
-
-def notify_slack():
-    with open("notion_old_pages_count.json", "r") as f:
-        total = json.load(f)["count"]
-
-    message = f"📄 Найдено *{total}* страниц, которые не редактировались больше года."
-
-    upload_file_to_slack("notion_old_pages.csv", message)
-
-
-# ============================================
-# MAIN switch
-# ============================================
-
-if ARTIFACT_URL:
-    notify_slack()
-else:
-    generate_csv_and_count()
+if __name__ == "__main__":
+    main()
