@@ -96,7 +96,7 @@ def get_all_pages(block_id):
 
 def send_to_slack(old_pages):
     if not SLACK_WEBHOOK_URL:
-        print("No Slack webhook configured")
+        print("SLACK_WEBHOOK_URL is empty! Check GitHub Secrets.")
         return
 
     total = len(old_pages)
@@ -105,9 +105,40 @@ def send_to_slack(old_pages):
         payload = {
             "text": "🎉 Нет страниц, которые не редактировались больше года!"
         }
-        requests.post(SLACK_WEBHOOK_URL, json=payload)
-        print("Sent Slack message: 0 pages")
-        return
+    else:
+        top_pages = old_pages[:20]
+
+        rows = "\n".join(
+            f"- *<{p['url']}|{p['title']}>* — `{p['last_edited']}`"
+            for p in top_pages
+        )
+
+        if total > 20:
+            rows += f"\n… и ещё *{total - 20}* страниц"
+
+        payload = {
+            "text": (
+                f"📄 *Отчёт Notion*\n"
+                f"Найдено *{total}* страниц, которые не редактировались больше года.\n\n"
+                f"{rows}"
+            )
+        }
+
+    print("\n=== Sending Slack message ===")
+    print("SLACK_WEBHOOK_URL:", SLACK_WEBHOOK_URL)
+    print("Payload to Slack:")
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+    try:
+        response = requests.post(SLACK_WEBHOOK_URL, json=payload)
+        print("Slack status:", response.status_code)
+        print("Slack response:", response.text)
+
+        response.raise_for_status()
+
+        print("Slack message sent successfully ✔")
+    except Exception as e:
+        print(f"Failed to send Slack message: {e}")
 
     # show max 20 items
     top_pages = old_pages[:20]
