@@ -7,25 +7,26 @@ import csv
 import json
 import argparse
 
-# аргумент для второго запуска (уведомление)
+# ===== Args for phase 2 (Slack run) =====
 parser = argparse.ArgumentParser()
 parser.add_argument("--artifact-url", default=None)
 args = parser.parse_args()
 
-ARTIFACT_URL = args.artifact_url
+ARTIFACT_URL = args.artifact_url  # not used for upload but kept for consistency
 
-# env
+# ===== Environment =====
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLACK_CHANNEL = os.getenv("SLACK_CHANNEL")
 
 notion = Client(auth=NOTION_TOKEN)
 ONE_YEAR_AGO = datetime.now(timezone.utc) - timedelta(days=365)
 
 
-# ============================================
-# Very stable working get_page_info (тот самый)
-# ============================================
+# ======================================================
+# Helpers
+# ======================================================
 
 def notion_url(page_id):
     clean = page_id.replace("-", "")
@@ -55,40 +56,54 @@ def get_page_info(page_id):
     }
 
 
-# ============================================================
-# ⭐⭐ Тот самый рабочий рекурсивный обход, который находил ВСЕ
-# ============================================================
+# ======================================================
+# ⭐⭐⭐ ТВОЯ РАБОЧАЯ РЕКУРСИЯ (full deep scan)
+# ======================================================
 
 def get_all_pages(block_id):
     pages = []
     cursor = None
 
     while True:
-        response = notion.blocks.children.list(block_id=block_id, start_cursor=cursor)
+        resp = notion.blocks.children.list(block_id=block_id, start_cursor=cursor)
 
-        for block in response["results"]:
+        for block in resp["results"]:
             btype = block["type"]
 
-            # 1. child_page → добавляем
+            # 1) child_page → это страница
             if btype == "child_page":
                 pid = block["id"]
                 try:
                     info = get_page_info(pid)
                     pages.append(info)
-                    # рекурсия
                     pages.extend(get_all_pages(pid))
-                except Exception as e:
-                    print(f"Skipping page {pid}: {e}")
+                except Exception:
+                    pass
 
-            # 2. любой блок с has_children → обходим (это критично!)
-            if block.get("has_children"):
+            # 2) Notion иногда скрывает подстраницы внутри:
+            #    column, lists, toggle, synced_block...
+            #    поэтому рекурсивно заходим ВСЕГДА
+            if block.get("has_children", False):
                 try:
                     pages.extend(get_all_pages(block["id"]))
                 except Exception:
                     pass
 
-        # Pagination
-        cursor = response.get("next_cursor")
+            # 3) 💥 КРИТИЧЕСКОЕ ДОПОЛНЕНИЕ:
+            #    даже если has_children=False — вложенные страницы МОГУТ быть внутри
+            if btype in [
+                "column", "column_list",
+                "bulleted_list_item", "numbered_list_item",
+                "toggle", "to_do",
+                "synced_block", "paragraph",
+                "quote", "callout"
+            ]:
+                try:
+                    pages.extend(get_all_pages(block["id"]))
+                except Exception:
+                    pass
+
+        cursor = resp.get("next_cursor")
         if not cursor:
             break
 
@@ -97,33 +112,43 @@ def get_all_pages(block_id):
     return pages
 
 
-# ============================================
-# Slack message
-# ============================================
+# ======================================================
+# Slack file upload (file + comment)
+# ======================================================
 
-def send_slack_message(total, artifact_url):
-    payload = {
-        "text": (
-            f"📄 Найдено *{total}* страниц, которые не редактировались больше года.\n"
-            f"📎 Скачать CSV: {artifact_url}"
+def upload_file_to_slack(filepath, message):
+    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL:
+        print("Slack bot token or channel missing.")
+        return
+
+    print("Uploading CSV to Slack...")
+
+    with open(filepath, "rb") as f:
+        response = requests.post(
+            "https://slack.com/api/files.upload",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            data={"channels": SLACK_CHANNEL, "initial_comment": message},
+            files={"file": f}
         )
-    }
 
-    print("Sending Slack message...")
-    r = requests.post(SLACK_WEBHOOK_URL, json=payload)
-    print("Slack status:", r.status_code)
-    print(r.text)
-    r.raise_for_status()
+    print("Slack upload status:", response.status_code)
+    print("Slack response:", response.text)
+
+    response.raise_for_status()
+
+    data = response.json()
+    if not data.get("ok"):
+        raise Exception(f"Slack error: {data.get('error')}")
 
 
-# ============================================
-# Phase 1 — generate CSV & count
-# ============================================
+# ======================================================
+# Phase 1 — scan Notion & generate CSV
+# ======================================================
 
 def generate_csv_and_count():
-    print("Fetching pages recursively...")
+    print("Scanning Notion deeply...")
     pages = get_all_pages(ROOT_PAGE_ID)
-    print(f"Total found: {len(pages)}")
+    print(f"Total discovered pages: {len(pages)}")
 
     old_pages = [
         {
@@ -136,36 +161,37 @@ def generate_csv_and_count():
     ]
 
     old_pages.sort(key=lambda x: x["last_edited"])
-    print(f"Old pages: {len(old_pages)}")
+    print(f"Old pages found: {len(old_pages)}")
 
-    # save CSV
+    # Save CSV
     with open("notion_old_pages.csv", "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["title", "last_edited", "url"])
         for p in old_pages:
             w.writerow([p["title"], p["last_edited"], p["url"]])
 
-    print("CSV saved")
-
-    # save count
     with open("notion_old_pages_count.json", "w") as f:
         json.dump({"count": len(old_pages)}, f, ensure_ascii=False)
 
+    print("CSV saved")
 
-# ============================================
-# Phase 2 — notify Slack
-# ============================================
+
+# ======================================================
+# Phase 2 — Slack notification with file
+# ======================================================
 
 def notify_slack():
     with open("notion_old_pages_count.json", "r") as f:
         total = json.load(f)["count"]
 
-    send_slack_message(total, ARTIFACT_URL)
+    message = f"📄 Найдено *{total}* страниц, которые не редактировались больше года."
+
+    upload_file_to_slack("notion_old_pages.csv", message)
 
 
-# ============================================
-# MAIN switch
-# ============================================
+# ======================================================
+# MAIN
+# ======================================================
 
 if ARTIFACT_URL:
     notify_slack()
