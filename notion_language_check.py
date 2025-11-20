@@ -1,407 +1,242 @@
 import os
-import csv
 import re
+import csv
 import time
+import json
+import math
 from notion_client import Client
+from langdetect import detect
 
-# ================== ENV ==================
-
+# ------------------------------------------
+# ENV
+# ------------------------------------------
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
 
 if not NOTION_TOKEN or not ROOT_PAGE_ID:
-    raise ValueError("Missing NOTION_TOKEN or ROOT_PAGE_ID env vars")
+    raise ValueError("Missing env vars NOTION_TOKEN or ROOT_PAGE_ID")
 
-# ================== NOTION CLIENT ==================
-
-def normalize_id(raw_id: str) -> str:
-    """Нормализуем page_id: выдёргиваем 32-значный hex или убираем дефисы."""
-    if not isinstance(raw_id, str):
-        return raw_id
-    s = raw_id.strip()
-    m = re.search(r"([0-9a-fA-F]{32})", s.replace("-", ""))
-    if m:
-        return m.group(1)
-    return s.replace("-", "")
-
-ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
 notion = Client(auth=NOTION_TOKEN)
 
-# ================== HELPERS ==================
 
-CYR_RE = re.compile(r"[А-Яа-яЁё]")
-LAT_RE = re.compile(r"[A-Za-z]")
-WORD_RE = re.compile(r"\b\w+\b", re.UNICODE)
-
-
-def notion_url(page_id: str) -> str:
-    clean = page_id.replace("-", "")
-    return f"https://www.notion.so/{clean}"
+def clean_id(raw):
+    raw = raw.replace("-", "")
+    if len(raw) == 32:
+        return raw
+    m = re.search(r"([0-9a-fA-F]{32})", raw)
+    return m.group(1) if m else raw
 
 
-def get_page_meta(page_id: str) -> dict:
-    """Получаем title + author для страницы."""
-    page = notion.pages.retrieve(page_id=page_id)
-
-    # title
-    title = "(untitled)"
-    props = page.get("properties", {}) or {}
-    for prop in props.values():
-        if prop.get("type") == "title":
-            parts = [t.get("plain_text", "") for t in prop.get("title", [])]
-            if parts:
-                title = "".join(parts)
-                break
-
-    # author
-    author = "(unknown)"
-    author_info = page.get("created_by", {}) or {}
-    if author_info.get("name"):
-        author = author_info["name"]
-    else:
-        uid = author_info.get("id")
-        if uid:
-            try:
-                user = notion.users.retrieve(user_id=uid)
-                if user.get("name"):
-                    author = user["name"]
-            except Exception:
-                pass
-
-    return {
-        "id": normalize_id(page_id),
-        "title": title,
-        "author": author,
-        "url": notion_url(page_id),
-        "properties": page.get("properties", {}) or {}
-    }
+ROOT_PAGE_ID = clean_id(ROOT_PAGE_ID)
 
 
-def get_blocks(block_id: str) -> list:
-    """Все дочерние блоки (только один уровень, с пагинацией)."""
-    blocks = []
+# ===============================================================
+# BLOCK FETCHING (pagination-safe)
+# ===============================================================
+def get_children(block_id):
+    out = []
     cursor = None
     while True:
-        try:
-            resp = notion.blocks.children.list(
-                block_id=block_id,
-                start_cursor=cursor
-            )
-        except Exception as e:
-            print(f"Can't get blocks for {block_id}: {e}")
-            break
-
-        blocks.extend(resp.get("results", []))
-
-        if not resp.get("has_more"):
-            break
+        resp = notion.blocks.children.list(block_id=block_id, start_cursor=cursor)
+        out.extend(resp["results"])
         cursor = resp.get("next_cursor")
-    return blocks
-
-# ================== ТЕКСТ ИЗ PROPERTIES ==================
-
-
-def extract_text_from_properties(properties: dict) -> str:
-    """Текст из свойств страницы (title, rich_text, select, multi_select и т.п.)."""
-    texts = []
-    if not isinstance(properties, dict):
-        return ""
-
-    for prop in properties.values():
-        ptype = prop.get("type")
-
-        if ptype == "title":
-            vals = prop.get("title", []) or []
-            texts.append(" ".join(t.get("plain_text", "") for t in vals if t.get("plain_text")))
-
-        elif ptype == "rich_text":
-            vals = prop.get("rich_text", []) or []
-            texts.append(" ".join(t.get("plain_text", "") for t in vals if t.get("plain_text")))
-
-        elif ptype == "select":
-            sel = prop.get("select")
-            if sel and sel.get("name"):
-                texts.append(sel["name"])
-
-        elif ptype == "multi_select":
-            for item in prop.get("multi_select", []) or []:
-                if item.get("name"):
-                    texts.append(item["name"])
-
-        elif ptype == "status":
-            st = prop.get("status")
-            if st and st.get("name"):
-                texts.append(st["name"])
-
-        elif ptype == "people":
-            for u in prop.get("people", []) or []:
-                if u.get("name"):
-                    texts.append(u["name"])
-
-        elif ptype in ("number", "url", "email", "phone"):
-            val = prop.get(ptype)
-            if val:
-                texts.append(str(val))
-
-    return " ".join(t for t in texts if t).strip()
-
-# ================== ПОЛНЫЙ РЕКУРСИВНЫЙ ВЫТЯГИВАТЕЛЬ ТЕКСТА ==================
+        if not cursor:
+            break
+        time.sleep(0.1)
+    return out
 
 
-def extract_all_text_from_block(block: dict) -> str:
-    """
-    Рекурсивно вытаскиваем весь human-readable текст из блока:
-    - параграфы, заголовки, списки, callout, to_do
-    - caption у image/embed/файлов
-    - equation
-    - column_list / column (оба столбца)
-    - synced_block (подтягиваем оригинальные дети)
-    - таблицы (table + table_row)
-    - любые дети (has_children)
-    """
-    texts = []
+# ===============================================================
+# FULL TEXT EXTRACTOR (column_list, column, table, synced_block, nested)
+# ===============================================================
+def extract_text(block):
     btype = block.get("type")
-    content = block.get(btype, {}) if btype else {}
+    txt = []
 
-    # Спец-обработка колонок: сразу углубляемся в детей
-    if btype in ("column_list", "column"):
-        try:
-            children = notion.blocks.children.list(block["id"]).get("results", [])
-            for ch in children:
-                texts.append(extract_all_text_from_block(ch))
-        except Exception:
-            pass
-        return " ".join(t for t in texts if t).strip()
+    content = block.get(btype, {}) or {}
 
-    # 1) rich_text в самом типе
-    if isinstance(content, dict) and "rich_text" in content:
-        rich_text = content.get("rich_text", []) or []
-        if rich_text:
-            texts.append(" ".join(t.get("plain_text", "") for t in rich_text if t.get("plain_text")))
+    # 1 rich_text
+    rt = content.get("rich_text")
+    if rt:
+        for t in rt:
+            if "plain_text" in t:
+                txt.append(t["plain_text"])
 
-    # 2) типы с rich_text
-    for key in [
-        "paragraph", "heading_1", "heading_2", "heading_3",
-        "quote", "callout", "bulleted_list_item",
-        "numbered_list_item", "toggle", "to_do"
-    ]:
-        if btype == key:
-            rt = block.get(key, {}).get("rich_text", []) or []
-            if rt:
-                texts.append(" ".join(t.get("plain_text", "") for t in rt if t.get("plain_text")))
+    # 2 caption
+    cap = content.get("caption")
+    if cap:
+        for t in cap:
+            if "plain_text" in t:
+                txt.append(t["plain_text"])
 
-    # 3) caption (image, embed, file и т.п.)
-    if isinstance(content, dict) and "caption" in content:
-        cap = content.get("caption", []) or []
-        if cap:
-            texts.append(" ".join(t.get("plain_text", "") for t in cap if t.get("plain_text")))
+    # 3 table row
+    if btype == "table_row":
+        for cell in content.get("cells", []):
+            for t in cell:
+                if "plain_text" in t:
+                    txt.append(t["plain_text"])
 
-    # 4) equation
+    # 4 equation
     if btype == "equation":
-        eq = block.get("equation", {}).get("expression")
-        if eq:
-            texts.append(eq)
+        expr = content.get("expression")
+        if expr:
+            txt.append(expr)
 
-    # 5) synced_block → если ссылка на оригинал — забираем детей оригинала
+    # 5 synced_block
     if btype == "synced_block":
-        synced = block.get("synced_block", {}) or {}
-        sf = synced.get("synced_from")
-        if sf and isinstance(sf, dict):
-            original_id = sf.get("block_id")
-            if original_id:
+        synced_from = content.get("synced_from")
+        if synced_from and synced_from.get("block_id"):
+            orig = synced_from["block_id"]
+            for ch in get_children(orig):
+                txt.append(extract_text(ch))
+
+    # 6 column / column_list (just go inside children)
+    if btype in ("column_list", "column"):
+        for ch in get_children(block["id"]):
+            txt.append(extract_text(ch))
+
+    # 7 other nested children
+    if block.get("has_children"):
+        for ch in get_children(block["id"]):
+            txt.append(extract_text(ch))
+
+    # join
+    return "\n".join(t for t in txt if t).strip()
+
+
+# ===============================================================
+# GET TEXT OF ENTIRE PAGE
+# ===============================================================
+def get_page_text(page_id):
+    blocks = get_children(page_id)
+    parts = []
+    for b in blocks:
+        parts.append(extract_text(b))
+    return "\n".join(p for p in parts if p).strip()
+
+
+# ===============================================================
+# DETECT LANGUAGE
+# ===============================================================
+def count_lang(text):
+    words_total = len(re.findall(r'\b\w+\b', text))
+    if words_total == 0:
+        return 0, 0
+
+    lang = "unknown"
+    try:
+        lang = detect(text)
+    except:
+        pass
+
+    if lang == "ru":
+        return words_total, 0
+    if lang == "en":
+        return 0, words_total
+    return 0, 0
+
+
+# ===============================================================
+# FIND ALL PAGES UNDER ROOT
+# ===============================================================
+def get_direct_children_pages(pid):
+    out = []
+    for b in get_children(pid):
+        if b["type"] == "child_page":
+            out.append(clean_id(b["id"]))
+    return out
+
+
+def get_all_subpages(root_id):
+    result = []
+    stack = [root_id]
+    visited = set()
+
+    while stack:
+        pid = stack.pop()
+        if pid in visited:
+            continue
+        visited.add(pid)
+
+        children = get_direct_children_pages(pid)
+        result.extend(children)
+        stack.extend(children)
+
+    return list(dict.fromkeys(result))  # remove duplicates
+
+
+# ===============================================================
+# MAIN BATCH PROCESS
+# ===============================================================
+def main():
+    pages = get_all_subpages(ROOT_PAGE_ID)
+    pages = [p for p in pages if p != ROOT_PAGE_ID]
+
+    print(f"Total pages under root: {len(pages)}")
+
+    batch_size = 20
+    batches = [pages[i:i+batch_size] for i in range(0, len(pages), batch_size)]
+
+    all_rows = []
+
+    for bi, batch in enumerate(batches, start=1):
+        print(f"Processing batch {bi}/{len(batches)} with {len(batch)} pages")
+
+        for pid in batch:
+            try:
+                page = notion.pages.retrieve(page_id=pid)
+            except:
+                print("Skip page, access denied:", pid)
+                continue
+
+            # title
+            title = "(untitled)"
+            for prop in page.get("properties", {}).values():
+                if prop.get("type") == "title" and prop.get("title"):
+                    title = prop["title"][0]["plain_text"]
+                    break
+
+            # author
+            author = "(unknown)"
+            a = page.get("created_by", {})
+            if a.get("name"):
+                author = a["name"]
+            elif a.get("id"):
                 try:
-                    children = notion.blocks.children.list(original_id).get("results", [])
-                    for ch in children:
-                        texts.append(extract_all_text_from_block(ch))
-                except Exception:
+                    u = notion.users.retrieve(user_id=a["id"])
+                    author = u.get("name", "(unknown)")
+                except:
                     pass
 
-    # 6) table → строки и ячейки
-    if btype == "table":
-        try:
-            rows = notion.blocks.children.list(block["id"]).get("results", [])
-            for row in rows:
-                if row.get("type") == "table_row":
-                    cells = row["table_row"].get("cells", []) or []
-                    for cell in cells:
-                        if cell:
-                            texts.append(" ".join(t.get("plain_text", "") for t in cell if t.get("plain_text")))
-        except Exception:
-            pass
+            # text
+            text = get_page_text(pid)
+            ru, en = count_lang(text)
 
-    # 7) рекурсия по has_children (toggles, lists, всё остальное)
-    if block.get("has_children"):
-        try:
-            children = notion.blocks.children.list(block["id"]).get("results", [])
-            for ch in children:
-                texts.append(extract_all_text_from_block(ch))
-        except Exception:
-            pass
+            total = ru + en
+            ru_pct = (ru/total*100) if total else 0
+            en_pct = (en/total*100) if total else 0
 
-    return " ".join(t for t in texts if t).strip()
+            all_rows.append({
+                "Page Title": title,
+                "Page URL": f"https://www.notion.so/{pid}",
+                "Author": author,
+                "% Russian": round(ru_pct, 2),
+                "% English": round(en_pct, 2)
+            })
 
-# ================== ПОДСЧЁТ СЛОВ RU / EN ==================
+    # sort
+    all_rows.sort(key=lambda x: (x["% English"], x["% Russian"]), reverse=True)
 
-
-def count_ru_en_words(text: str) -> tuple[int, int]:
-    ru = 0
-    en = 0
-    if not text:
-        return ru, en
-
-    for w in WORD_RE.findall(text):
-        has_cyr = bool(CYR_RE.search(w))
-        has_lat = bool(LAT_RE.search(w))
-        if has_cyr:
-            ru += 1
-        if has_lat:
-            en += 1
-    return ru, en
-
-# ================== СБОР ВСЕХ СТРАНИЦ ПОД ROOT ==================
-
-
-def collect_pages_under_root(root_page_id: str) -> list[dict]:
-    """
-    Рекурсивно обходим блоки под ROOT_PAGE_ID.
-    Берём все child_page, куда бы они ни были засунуты (в том числе в несколько столбцов).
-    """
-    pages: dict[str, dict] = {}
-    visited_blocks = set()
-
-    def walk(block_id: str):
-        if block_id in visited_blocks:
-            return
-        visited_blocks.add(block_id)
-
-        cursor = None
-        while True:
-            resp = notion.blocks.children.list(block_id=block_id, start_cursor=cursor)
-            for block in resp.get("results", []):
-                btype = block.get("type")
-
-                if btype == "child_page":
-                    pid = normalize_id(block["id"])
-                    if pid not in pages:
-                        try:
-                            meta = get_page_meta(pid)
-                            pages[pid] = meta
-                            # рекурсивно обходим содержимое страницы
-                            walk(pid)
-                        except Exception as e:
-                            print(f"Skipping page {pid}: {e}")
-
-                # любой блок с детьми — идём внутрь (колонки, toggles и т.д.)
-                if block.get("has_children"):
-                    try:
-                        walk(block["id"])
-                    except Exception:
-                        pass
-
-            if not resp.get("has_more"):
-                break
-            cursor = resp.get("next_cursor")
-            time.sleep(0.1)
-
-    # старт: сама root-страница
-    # сначала добавим root как страницу
-    try:
-        root_meta = get_page_meta(root_page_id)
-        pages[root_meta["id"]] = root_meta
-    except Exception as e:
-        print(f"Cannot retrieve root page meta: {e}")
-
-    walk(root_page_id)
-    return list(pages.values())
-
-# ================== АНАЛИЗ ОДНОЙ СТРАНИЦЫ ==================
-
-
-def analyze_page(page_id: str, properties: dict) -> tuple[int, int, bool]:
-    """
-    Возвращает (ru_words, en_words, unreadable_flag).
-    unreadable=True, если вообще не нашли текста.
-    """
-    full_text_parts = []
-
-    # properties
-    props_text = extract_text_from_properties(properties)
-    if props_text:
-        full_text_parts.append(props_text)
-
-    # blocks
-    blocks = get_blocks(page_id)
-    for block in blocks:
-        # подстраницы считаем отдельно как отдельные страницы
-        if block.get("type") == "child_page":
-            continue
-        txt = extract_all_text_from_block(block)
-        if txt:
-            full_text_parts.append(txt)
-
-    full_text = "\n".join(part for part in full_text_parts if part).strip()
-    if not full_text:
-        return 0, 0, True
-
-    ru, en = count_ru_en_words(full_text)
-    return ru, en, False
-
-# ================== MAIN ==================
-
-
-def main():
-    start = time.time()
-
-    print(f"Collecting pages under ROOT_PAGE_ID={ROOT_PAGE_ID}...")
-    pages = collect_pages_under_root(ROOT_PAGE_ID)
-    print(f"Found {len(pages)} pages (including root).")
-
-    results = []
-    unreadable_pages = []
-
-    for meta in pages:
-        pid = meta["id"]
-        title = meta["title"]
-        url = meta["url"]
-        author = meta["author"]
-
-        ru, en, unreadable = analyze_page(pid, meta.get("properties", {}))
-        if unreadable:
-            print(f"⚠ No readable text on page: {title} — {url}")
-            unreadable_pages.append((title, url))
-
-        total = ru + en
-        ru_pct = (ru / total * 100) if total else 0.0
-        en_pct = (en / total * 100) if total else 0.0
-
-        results.append({
-            "Page Title": title,
-            "Page URL": url,
-            "Author": author,
-            "% Russian": round(ru_pct, 2),
-            "% English": round(en_pct, 2),
-        })
-
-    # сортировка: сначала по %English, потом по %Russian (оба по убыванию)
-    results.sort(key=lambda x: (x["% English"], x["% Russian"]), reverse=True)
-
-    out_name = "notion_language_percentages.csv"
-    with open(out_name, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
+    # write CSV
+    with open("notion_language_report.csv", "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(
             f,
             fieldnames=["Page Title", "Page URL", "Author", "% Russian", "% English"]
         )
-        writer.writeheader()
-        writer.writerows(results)
+        w.writeheader()
+        w.writerows(all_rows)
 
-    print(f"\nSaved {len(results)} rows to {out_name}")
-
-    if unreadable_pages:
-        print("\n⚠ Pages without readable text (no props and no blocks, или нет прав у интеграции):")
-        for title, url in unreadable_pages:
-            print(f" - {title}: {url}")
-
-    print(f"\nDone in {time.time() - start:.1f}s")
+    print("Saved notion_language_report.csv")
 
 
 if __name__ == "__main__":
