@@ -4,32 +4,65 @@ on:
   workflow_dispatch:
 
 jobs:
-  run-check:
+
+  collect:
     runs-on: ubuntu-latest
-
+    outputs:
+      batch-count: ${{ steps.set.outputs.count }}
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - name: Calc batches
+        id: set
+        run: |
+          TOTAL=2000
+          SIZE=20
+          COUNT=$(( (TOTAL + SIZE - 1) / SIZE ))
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+  batch:
+    needs: collect
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        batch: ${{ range(0, needs.collect.outputs.batch-count | int) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install notion-client langdetect requests
+      - run: |
+          pip install notion-client langdetect
 
-      - name: Run analysis
+      - name: Run batch
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+          BATCH_INDEX: ${{ matrix.batch }}
+          BATCH_SIZE: 20
         run: |
           python notion_language_check.py
 
-      - name: Upload CSV artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: batch_${{ matrix.batch }}
+          path: batch_${{ matrix.batch }}.csv
+
+
+  merge:
+    needs: batch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Merge CSV
+        run: |
+          echo "Page Title,Page URL,% Russian,% English" > final.csv
+          for f in batch_*/batch_*.csv; do
+            tail -n +2 "$f" >> final.csv
+          done
+
+      - uses: actions/upload-artifact@v4
         with:
           name: notion_language_report
-          path: notion_language_percentages.csv
+          path: final.csv
