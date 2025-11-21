@@ -1,57 +1,35 @@
-name: Daily Notion Old Pages Report
+name: Notion Language Check
 
 on:
-  schedule:
-    - cron: "0 9 * * *"
   workflow_dispatch:
 
 jobs:
-  notion-report:
+  run-check:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
-          pip install notion-client==2.2.1
-          pip install requests
+          python -m pip install --upgrade pip
+          pip install notion-client langdetect
 
-      # Phase 1 — generate CSV
-      - name: Run Notion Analyzer
-        run: python notion_old_page_monitor.py
+      - name: Run language check
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+        run: |
+          python notion_language_check.py
 
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
-        id: up
         with:
-          name: notion-old-pages
-          path: notion_old_pages.csv
-
-      - name: Get Artifact URL for Slack
-        id: artifact_url
-        uses: actions/github-script@v7
-        with:
-          result-encoding: string
-          script: |
-            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: context.runId
-            });
-            const artifact = artifacts.data.artifacts.find(a => a.name === "notion-old-pages");
-            return `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/artifacts/${artifact.id}`;
-
-      # Phase 2 — Slack (remote.add)
-      - name: Send Slack notification
-        run: python notion_old_page_monitor.py --artifact-url "${{ steps.artifact_url.outputs.result }}"
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
+          name: notion-language-report
+          path: notion_language_percentages.csv
