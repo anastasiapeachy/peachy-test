@@ -8,22 +8,34 @@ jobs:
   collect:
     runs-on: ubuntu-latest
     outputs:
-      batch-count: ${{ steps.set.outputs.count }}
+      batches: ${{ steps.calc.outputs.batches }}
     steps:
-      - name: Calc batches
-        id: set
+      - name: Determine batch count
+        id: calc
         run: |
           TOTAL=2000
           SIZE=20
           COUNT=$(( (TOTAL + SIZE - 1) / SIZE ))
-          echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+          # создаём JSON-массив: ["0","1","2",...]
+          LIST="["
+          for ((i=0; i<COUNT; i++)); do
+            if [ $i -gt 0 ]; then LIST="$LIST,"; fi
+            LIST="$LIST\"$i\""
+          done
+          LIST="$LIST]"
+
+          echo "batches=$LIST" >> $GITHUB_OUTPUT
+        shell: bash
+
 
   batch:
     needs: collect
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        batch: ${{ range(0, needs.collect.outputs.batch-count | int) }}
+        batch: ${{ fromJson(needs.collect.outputs.batches) }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -31,7 +43,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - run: |
+      - name: Install python deps
+        run: |
           pip install notion-client langdetect
 
       - name: Run batch
@@ -43,7 +56,8 @@ jobs:
         run: |
           python notion_language_check.py
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload batch artifact
+        uses: actions/upload-artifact@v4
         with:
           name: batch_${{ matrix.batch }}
           path: batch_${{ matrix.batch }}.csv
