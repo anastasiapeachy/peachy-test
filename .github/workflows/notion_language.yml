@@ -4,32 +4,61 @@ on:
   workflow_dispatch:
 
 jobs:
-  run-check:
+
+  list-pages:
     runs-on: ubuntu-latest
-
+    outputs:
+      pages: ${{ steps.collect.outputs.pages }}
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
-          python -m pip install --upgrade pip
           pip install notion-client langdetect requests
 
-      - name: Run analysis
+      - name: List pages
+        id: collect
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
         run: |
-          python notion_language_check.py
+          PAGES=$(python notion_language_check.py --list-pages)
+          echo "pages=$PAGES" >> $GITHUB_OUTPUT
 
-      - name: Upload CSV artifact
+  process-batches:
+    needs: list-pages
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        batch: ${{ fromJson(needs.list-pages.outputs.pages) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install notion-client langdetect requests
+
+      - name: Process batch
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+        run: |
+          python notion_language_check.py --batch "${{ matrix.batch }}"
+
+      - name: Upload artifact (partial)
         uses: actions/upload-artifact@v4
         with:
           name: notion_language_report
           path: notion_language_percentages.csv
+          if-no-files-found: ignore
