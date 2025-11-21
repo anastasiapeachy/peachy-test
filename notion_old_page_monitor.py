@@ -1,225 +1,200 @@
-from notion_client import Client
 import os
-import time
-import requests
-from datetime import datetime, timezone, timedelta
 import csv
-import json
-import argparse
+import time
+from datetime import datetime, timedelta, timezone
+from notion_client import Client
+from notion_client.errors import APIResponseError, HTTPResponseError
 
-# ===== Args for phase 2 (Slack run) =====
-parser = argparse.ArgumentParser()
-parser.add_argument("--artifact-url", default=None)
-args = parser.parse_args()
-
-ARTIFACT_URL = args.artifact_url
-
-# ===== Environment =====
+# ------------------------------------
+# Environment
+# ------------------------------------
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
-SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-SLACK_CHANNEL = os.getenv("SLACK_CHANNEL")
+
+if not NOTION_TOKEN or not ROOT_PAGE_ID:
+    raise ValueError("Missing NOTION_TOKEN or ROOT_PAGE_ID environment variables")
 
 notion = Client(auth=NOTION_TOKEN)
-ONE_YEAR_AGO = datetime.now(timezone.utc) - timedelta(days=365)
+
+NOW = datetime.now(timezone.utc)
+ONE_YEAR_AGO = NOW - timedelta(days=365)
 
 
-# ======================================================
-# Helpers
-# ======================================================
+# ------------------------------------
+# Utilities
+# ------------------------------------
+def normalize_id(raw_id: str) -> str:
+    raw_id = raw_id.strip()
+    if "/" in raw_id:
+        raw_id = raw_id.split("/")[-1]
+    return raw_id.replace("-", "")
 
-def notion_url(page_id):
-    clean = page_id.replace("-", "")
-    return f"https://www.notion.so/{clean}"
-
-
-def get_page_info(page_id):
-    page = notion.pages.retrieve(page_id=page_id)
-
-    title = "Untitled"
-    if "properties" in page:
-        for prop in page["properties"].values():
-            if prop["type"] == "title" and prop.get("title"):
-                title = prop["title"][0]["plain_text"]
-                break
-
-    last_raw = page.get("last_edited_time", "")
-    last_dt = datetime.fromisoformat(last_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
-
-    return {
-        "id": page_id,
-        "title": title,
-        "url": notion_url(page_id),
-        "last_edited": last_dt
-    }
+ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
 
 
-# ======================================================
-# ⭐⭐⭐ ТВОЯ РЕАЛЬНАЯ РАБОЧАЯ РЕКУРСИЯ — полный обход Notion
-# ======================================================
+def safe_request(func, *args, **kwargs):
+    """
+    Ultra-safe wrapper:
+    - retries on 429
+    - retries on ALL 5xx including 502, 503, 504
+    - retries on network timeouts
+    - exponential backoff (1 → 2 → 4 → ... → 60 sec)
+    """
+    max_retries = 15
+    backoff = 1  # seconds
 
-def get_all_pages(block_id):
-    pages = []
-    cursor = None
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+
+        except (APIResponseError, HTTPResponseError) as e:
+            status = getattr(e, "status", None)
+
+            # 429 Too Many Requests
+            if status == 429:
+                retry_after = int(getattr(e, "headers", {}).get("Retry-After", 1))
+                print(f"[429] Rate limit — waiting {retry_after}s...")
+                time.sleep(retry_after)
+                continue
+
+            # Any 5xx (500–599), including 502/503/504
+            if status and 500 <= status <= 599:
+                print(f"[{status}] Server error — retry {attempt+1}/{max_retries} in {backoff}s...")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)  # exponential backoff max 60s
+                continue
+
+            # No status — connection issue, weird API timeout
+            print(f"[NETWORK] Error '{e}' — retrying in {backoff}s...")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
+
+        except Exception as e:
+            print(f"[UNKNOWN ERROR] {e} — retrying in {backoff}s...")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
+
+    raise RuntimeError("Too many retries — Notion API still failing.")
+
+
+def get_block_children(container_id: str):
+    """Retrieve all child blocks (columns, toggles, synced blocks, etc.)."""
+    blocks = []
+    next_cursor = None
 
     while True:
-        resp = notion.blocks.children.list(block_id=block_id, start_cursor=cursor)
-
-        for block in resp["results"]:
-            btype = block["type"]
-
-            # 1) child_page → это страница
-            if btype == "child_page":
-                pid = block["id"]
-                try:
-                    info = get_page_info(pid)
-                    pages.append(info)
-                    pages.extend(get_all_pages(pid))
-                except Exception:
-                    pass
-
-            # 2) блоки с has_children → всегда внутрь
-            if block.get("has_children", False):
-                try:
-                    pages.extend(get_all_pages(block["id"]))
-                except Exception:
-                    pass
-
-            # 3) 💥 Важнейший блок: глубоко сканируем даже если has_children=False
-            if btype in [
-                "column", "column_list",
-                "bulleted_list_item", "numbered_list_item",
-                "toggle", "to_do", "synced_block",
-                "paragraph", "quote", "callout"
-            ]:
-                try:
-                    pages.extend(get_all_pages(block["id"]))
-                except Exception:
-                    pass
-
-        cursor = resp.get("next_cursor")
-        if not cursor:
+        response = safe_request(
+            notion.blocks.children.list,
+            block_id=container_id,
+            start_cursor=next_cursor
+        )
+        blocks.extend(response.get("results", []))
+        next_cursor = response.get("next_cursor")
+        if not next_cursor:
             break
 
-        time.sleep(0.15)
-
-    return pages
+    return blocks
 
 
-# ======================================================
-# Slack: upload via files.remote.add + remote.share + chat.postMessage
-# ======================================================
+def get_page_info(page):
+    """Extract page title, last edited timestamp, URL."""
+    props = page.get("properties", {})
 
-def upload_file_to_slack(filepath, message):
-    bot_token = SLACK_BOT_TOKEN
-    channel = SLACK_CHANNEL
-    artifact_url = ARTIFACT_URL  # GitHub ZIP URL
+    title_prop = props.get("title") or props.get("Name")
+    if title_prop and title_prop.get("title"):
+        title = "".join(t["plain_text"] for t in title_prop["title"])
+    else:
+        title = "(untitled)"
 
-    if not bot_token or not channel:
-        print("Slack bot token or channel missing.")
-        return
+    last_edited_raw = page["last_edited_time"].replace("Z", "+00:00")
+    last_edited = datetime.fromisoformat(last_edited_raw).astimezone(timezone.utc)
 
-    print("Uploading file to Slack via files.remote.add ...")
+    url = f"https://notion.so/{page['id'].replace('-', '')}"
 
-    # 1) Добавляем удалённый файл
-    remote = requests.post(
-        "https://slack.com/api/files.remote.add",
-        headers={"Authorization": f"Bearer {bot_token}"},
-        data={
-            "external_id": "notion-old-pages-file",
-            "title": "Notion Old Pages CSV",
-            "filetype": "csv",
-            "external_url": artifact_url,
-        }
-    )
-
-    print("remote.add:", remote.status_code, remote.text)
-    j = remote.json()
-    if not j.get("ok"):
-        raise Exception(f"Slack remote.add error: {j.get('error')}")
-
-    file_id = j["file"]["id"]
-
-    # 2) Делаем видимым в нужном канале
-    share = requests.post(
-        "https://slack.com/api/files.remote.share",
-        headers={"Authorization": f"Bearer {bot_token}"},
-        data={"file": file_id, "channels": channel}
-    )
-
-    print("remote.share:", share.status_code, share.text)
-    s = share.json()
-    if not s.get("ok"):
-        raise Exception(f"Slack share error: {s.get('error')}")
-
-    # 3) Отправляем сообщение в канал
-    msg = requests.post(
-        "https://slack.com/api/chat.postMessage",
-        headers={"Authorization": f"Bearer {bot_token}", "Content-type": "application/json"},
-        json={
-            "channel": channel,
-            "text": message
-        }
-    )
-
-    print("postMessage:", msg.status_code, msg.text)
-    m = msg.json()
-    if not m.get("ok"):
-        raise Exception(f"Slack message error: {m.get('error')}")
+    return title, last_edited, url
 
 
-# ======================================================
-# Phase 1 — scan Notion & generate CSV
-# ======================================================
+def fetch_all_pages_recursively(container_id: str, collected_pages: list):
+    """Recursively scan ALL child pages, including those inside columns."""
+    children = get_block_children(container_id)
 
-def generate_csv_and_count():
-    print("Scanning Notion deeply...")
-    pages = get_all_pages(ROOT_PAGE_ID)
-    print(f"Total discovered pages: {len(pages)}")
+    for block in children:
+        block_type = block["type"]
 
-    old_pages = [
-        {
-            "title": p["title"],
-            "last_edited": p["last_edited"].isoformat(),
-            "url": p["url"]
-        }
-        for p in pages
-        if p["last_edited"] < ONE_YEAR_AGO
-    ]
+        # Direct child page
+        if block_type == "child_page":
+            page_id = block["id"]
+            page = safe_request(notion.pages.retrieve, page_id)
+            collected_pages.append(page)
+            fetch_all_pages_recursively(page_id, collected_pages)
 
-    old_pages.sort(key=lambda x: x["last_edited"])
-    print(f"Old pages found: {len(old_pages)}")
-
-    with open("notion_old_pages.csv", "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["title", "last_edited", "url"])
-        for p in old_pages:
-            w.writerow([p["title"], p["last_edited"], p["url"]])
-
-    with open("notion_old_pages_count.json", "w") as f:
-        json.dump({"count": len(old_pages)}, f, ensure_ascii=False)
-
-    print("CSV saved")
+        # Any container block with nested content
+        if block.get("has_children") and block_type != "child_page":
+            fetch_all_pages_recursively(block["id"], collected_pages)
 
 
-# ======================================================
-# Phase 2 — Slack notification
-# ======================================================
+# ------------------------------------
+# Main
+# ------------------------------------
+def main():
+    print("🔍 Scanning Notion pages under ROOT recursively...")
 
-def notify_slack():
-    with open("notion_old_pages_count.json", "r") as f:
-        total = json.load(f)["count"]
+    all_pages = []
 
-    message = f"📄 Найдено *{total}* страниц, которые не редактировались больше года."
+    # Try getting root page
+    try:
+        root_page = safe_request(notion.pages.retrieve, ROOT_PAGE_ID)
+        all_pages.append(root_page)
+    except Exception as e:
+        print(f"Warning: cannot retrieve ROOT page: {e}")
 
-    upload_file_to_slack("notion_old_pages.csv", message)
+    fetch_all_pages_recursively(ROOT_PAGE_ID, all_pages)
+
+    print(f"📄 Total pages found (including root): {len(all_pages)}")
+
+    records = []
+
+    for page in all_pages:
+        title, last_edited, url = get_page_info(page)
+        is_old = last_edited < ONE_YEAR_AGO
+
+        records.append({
+            "title": title,
+            "last_edited": last_edited,
+            "last_edited_str": last_edited.isoformat(),
+            "url": url,
+            "is_old": "yes" if is_old else "no",
+        })
+
+        time.sleep(0.05)
+
+    # Sort by last edited (oldest first)
+    records.sort(key=lambda r: r["last_edited"])
+
+    old_pages = [r for r in records if r["is_old"] == "yes"]
+
+    # --------------------------------------------
+    # CSV: all pages
+    # --------------------------------------------
+    with open("notion_all_pages.csv", "w", newline="", encoding="utf-8") as f:
+        wr = csv.writer(f)
+        wr.writerow(["title", "last_edited", "url", "is_old"])
+        for r in records:
+            wr.writerow([r["title"], r["last_edited_str"], r["url"], r["is_old"]])
+
+    # --------------------------------------------
+    # CSV: old pages only
+    # --------------------------------------------
+    with open("notion_old_pages.csv", "w", newline="", encoding="utf-8") as f:
+        wr = csv.writer(f)
+        wr.writerow(["title", "last_edited", "url"])
+        for r in old_pages:
+            wr.writerow([r["title"], r["last_edited_str"], r["url"]])
+
+    print("\n📁 CSV saved: notion_all_pages.csv, notion_old_pages.csv")
 
 
-# ======================================================
-# MAIN
-# ======================================================
-
-if ARTIFACT_URL:
-    notify_slack()
-else:
-    generate_csv_and_count()
+if __name__ == "__main__":
+    main()
