@@ -268,8 +268,14 @@ def analyze_page(page_id):
 
     blocks = get_blocks(page_id)
     for block in blocks:
-        if block.get("type") == "child_page":
-            continue
+    if block["type"] == "child_page":
+        # анализируем дочернюю страницу как страницу
+        sub_id = normalize_id(block["id"])
+        sub_page = notion.pages.retrieve(page_id=sub_id)
+        sub_ru, sub_en = analyze_page(sub_id)
+        ru += sub_ru
+        en += sub_en
+        continue
         text = extract_all_text_from_block(block)
         if not text:
             continue
