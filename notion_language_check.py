@@ -3,6 +3,7 @@ import csv
 import re
 import time
 from notion_client import Client
+from notion_client.errors import APIResponseError
 from langdetect import detect
 
 # ===========================================================
@@ -33,6 +34,29 @@ def normalize_id(raw_id):
 ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
 
 # ===========================================================
+# Safe Notion call with basic retry for rate limit
+# ===========================================================
+
+def notion_call(method, *args, **kwargs):
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return method(*args, **kwargs)
+        except APIResponseError as e:
+            msg = str(e).lower()
+            status = getattr(e, "status", None)
+            if status == 429 or "rate limited" in msg:
+                wait = min(60, 2 ** attempt)
+                print(f"[Rate limit] {method.__name__} attempt {attempt}/{max_attempts}, sleep {wait}s...")
+                time.sleep(wait)
+                continue
+            raise
+        except Exception as e:
+            # Для нестандартных ошибок просто пробрасываем
+            raise
+    raise RuntimeError(f"Max retries exceeded for {method.__name__}")
+
+# ===========================================================
 # Fetch all pages in workspace
 # ===========================================================
 
@@ -41,7 +65,8 @@ def get_all_pages_in_workspace():
     cursor = None
 
     while True:
-        resp = notion.search(
+        resp = notion_call(
+            notion.search,
             query="",
             filter={"value": "page", "property": "object"},
             start_cursor=cursor
@@ -53,6 +78,7 @@ def get_all_pages_in_workspace():
             break
 
         cursor = resp.get("next_cursor")
+        time.sleep(0.1)
 
     return pages
 
@@ -68,10 +94,10 @@ def get_title(page):
             if parts:
                 return "".join(parts)
     try:
-        blk = notion.blocks.retrieve(block_id=page["id"])
-        if blk["type"] == "child_page":
-            return blk["child_page"]["title"]
-    except:
+        blk = notion_call(notion.blocks.retrieve, block_id=page["id"])
+        if blk.get("type") == "child_page":
+            return blk["child_page"].get("title", "(untitled)")
+    except Exception:
         pass
     return "(untitled)"
 
@@ -89,8 +115,13 @@ def get_blocks(block_id):
 
     while True:
         try:
-            resp = notion.blocks.children.list(block_id=block_id, start_cursor=cursor)
-        except:
+            resp = notion_call(
+                notion.blocks.children.list,
+                block_id=block_id,
+                start_cursor=cursor
+            )
+        except Exception as e:
+            print(f"Can't get blocks for {block_id}: {e}")
             break
 
         blocks.extend(resp.get("results", []))
@@ -98,11 +129,12 @@ def get_blocks(block_id):
         if not resp.get("has_more"):
             break
         cursor = resp.get("next_cursor")
+        time.sleep(0.1)
 
     return blocks
 
 # ===========================================================
-# FULL TEXT EXTRACTOR — THE GOOD ONE
+# FULL TEXT EXTRACTOR (correct columns support)
 # ===========================================================
 
 def extract_all_text_from_block(block):
@@ -110,22 +142,25 @@ def extract_all_text_from_block(block):
     btype = block.get("type")
     content = block.get(btype, {}) if btype else {}
 
-    # Correct handling for columns
+    # FIX: Columns (column_list / column)
     if btype in ("column_list", "column"):
         try:
-            children = notion.blocks.children.list(block["id"]).get("results", [])
+            children = notion_call(
+                notion.blocks.children.list,
+                block_id=block["id"]
+            ).get("results", [])
             for child in children:
                 texts.append(extract_all_text_from_block(child))
-        except:
+        except Exception:
             pass
         return " ".join(t for t in texts if t).strip()
 
-    # Rich text
+    # generic rich_text
     if isinstance(content, dict) and "rich_text" in content:
         rich = content.get("rich_text", [])
-        texts.append(" ".join(t.get("plain_text", "") for t in rich))
+        texts.append(" ".join(t.get("plain_text", "") for t in rich if t.get("plain_text")))
 
-    # Headings, paragraphs, list items etc
+    # paragraph, headings, etc
     for key in [
         "paragraph", "heading_1", "heading_2", "heading_3",
         "quote", "callout", "bulleted_list_item",
@@ -133,51 +168,60 @@ def extract_all_text_from_block(block):
     ]:
         if btype == key:
             rt = block.get(key, {}).get("rich_text", [])
-            texts.append(" ".join(t.get("plain_text", "") for t in rt))
+            texts.append(" ".join(t.get("plain_text", "") for t in rt if t.get("plain_text")))
 
-    # Caption
+    # caption
     if isinstance(content, dict) and "caption" in content:
         cap = content.get("caption", [])
-        texts.append(" ".join(t.get("plain_text", "") for t in cap))
+        texts.append(" ".join(t.get("plain_text", "") for t in cap if t.get("plain_text")))
 
-    # Synced block
+    # synced_block
     if btype == "synced_block":
         sf = block.get("synced_block", {}).get("synced_from")
         if sf:
             original_id = sf.get("block_id")
             if original_id:
                 try:
-                    children = notion.blocks.children.list(original_id).get("results", [])
+                    children = notion_call(
+                        notion.blocks.children.list,
+                        block_id=original_id
+                    ).get("results", [])
                     for child in children:
                         texts.append(extract_all_text_from_block(child))
-                except:
+                except Exception:
                     pass
 
-    # Tables
+    # table
     if btype == "table":
         try:
-            rows = notion.blocks.children.list(block["id"]).get("results", [])
+            rows = notion_call(
+                notion.blocks.children.list,
+                block_id=block["id"]
+            ).get("results", [])
             for row in rows:
-                if row["type"] == "table_row":
+                if row.get("type") == "table_row":
                     cells = row["table_row"]["cells"]
                     for cell in cells:
-                        texts.append(" ".join(t.get("plain_text", "") for t in cell))
-        except:
+                        texts.append(" ".join(t.get("plain_text", "") for t in cell if t.get("plain_text")))
+        except Exception:
             pass
 
-    # Children recursion
+    # recursion into children
     if block.get("has_children"):
         try:
-            children = notion.blocks.children.list(block["id"]).get("results", [])
+            children = notion_call(
+                notion.blocks.children.list,
+                block_id=block["id"]
+            ).get("results", [])
             for child in children:
                 texts.append(extract_all_text_from_block(child))
-        except:
+        except Exception:
             pass
 
     return " ".join(t for t in texts if t).strip()
 
 # ===========================================================
-# Parent resolution for blocks in columns
+# Parent resolution for nested blocks in columns
 # ===========================================================
 
 def resolve_block_parent_to_page(block_id):
@@ -187,16 +231,20 @@ def resolve_block_parent_to_page(block_id):
             return None
         visited.add(block_id)
         try:
-            blk = notion.blocks.retrieve(block_id=block_id)
-        except:
+            blk = notion_call(notion.blocks.retrieve, block_id=block_id)
+        except Exception:
             return None
+
         parent = blk.get("parent", {})
         ptype = parent.get("type")
+
         if ptype == "page_id":
             return normalize_id(parent["page_id"])
+
         if ptype == "block_id":
             block_id = parent["block_id"]
             continue
+
         return None
 
 # ===========================================================
@@ -217,7 +265,7 @@ def is_child_of_root(page, root_id, page_index):
             if pid in visited:
                 return False
             visited.add(pid)
-            current = page_index.get(pid) or notion.pages.retrieve(pid)
+            current = page_index.get(pid) or notion_call(notion.pages.retrieve, page_id=pid)
             continue
 
         elif ptype == "block_id":
@@ -228,7 +276,7 @@ def is_child_of_root(page, root_id, page_index):
             if not resolved or resolved in visited:
                 return False
             visited.add(resolved)
-            current = page_index.get(resolved) or notion.pages.retrieve(resolved)
+            current = page_index.get(resolved) or notion_call(notion.pages.retrieve, page_id=resolved)
             continue
 
         else:
@@ -241,14 +289,14 @@ def is_child_of_root(page, root_id, page_index):
 def detect_lang(text):
     try:
         return detect(text)
-    except:
+    except Exception:
         return "unknown"
 
 def count_words(text):
     return len(re.findall(r'\b\w+\b', text))
 
 # ===========================================================
-# FIXED analyze_page() — MAIN BUG FIX
+# Analyze page
 # ===========================================================
 
 def analyze_page(page_id):
@@ -256,16 +304,14 @@ def analyze_page(page_id):
     en = 0
 
     blocks = get_blocks(page_id)
-
     for block in blocks:
+        if block.get("type") == "child_page":
+            continue
         text = extract_all_text_from_block(block)
-
         if not text:
             continue
-
         lang = detect_lang(text)
         words = count_words(text)
-
         if lang == "ru":
             ru += words
         elif lang == "en":
@@ -274,7 +320,7 @@ def analyze_page(page_id):
     return ru, en
 
 # ===========================================================
-# MAIN with batching
+# MAIN WITH BATCHING
 # ===========================================================
 
 def main():
@@ -284,7 +330,7 @@ def main():
     all_pages = get_all_pages_in_workspace()
     page_index = {normalize_id(p["id"]): p for p in all_pages}
 
-    # Select pages under root
+    # select only pages under root
     selected = []
     for p in all_pages:
         pid = normalize_id(p["id"])
@@ -297,7 +343,7 @@ def main():
     print(f"Total pages under root: {len(selected)}")
 
     batch_size = 20
-    batches = [selected[i:i+batch_size] for i in range(0, len(selected), batch_size)]
+    batches = [selected[i:i + batch_size] for i in range(0, len(selected), batch_size)]
 
     results = []
 
@@ -306,19 +352,22 @@ def main():
 
         for p in batch:
             pid = normalize_id(p["id"])
-            page = page_index.get(pid) or notion.pages.retrieve(pid)
-
+            page = page_index.get(pid) or notion_call(notion.pages.retrieve, page_id=pid)
             title = get_title(page)
             url = make_url(pid)
 
-            author_info = page.get("created_by", {})
+            author_info = page.get("created_by", {}) or {}
             author = author_info.get("name")
             if not author:
-                try:
-                    u = notion.users.retrieve(author_info.get("id"))
-                    author = u.get("name")
-                except:
-                    author = "(unknown)"
+                uid = author_info.get("id")
+                if uid:
+                    try:
+                        user = notion_call(notion.users.retrieve, user_id=uid)
+                        author = user.get("name")
+                    except Exception:
+                        author = "(unknown)"
+            if not author:
+                author = "(unknown)"
 
             ru, en = analyze_page(pid)
             total = ru + en
@@ -333,19 +382,22 @@ def main():
                 "% English": round(en_pct, 2),
             })
 
+        # пауза между батчами, чтобы уменьшить шанс 429
         time.sleep(1.0)
 
-    # Sort
+    if not results:
+        print("No pages to save.")
+        return
+
     results.sort(key=lambda x: (x["% English"], x["% Russian"]), reverse=True)
 
-    # Final CSV
-    out = "notion_language_percentages.csv"
-    with open(out, "w", newline="", encoding="utf-8") as f:
+    fname = "notion_language_percentages.csv"
+    with open(fname, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(results[0].keys()))
         w.writeheader()
         w.writerows(results)
 
-    print(f"\nSaved {len(results)} rows → {out}")
+    print(f"\nSaved {len(results)} rows → {fname}")
     print(f"Done in {time.time() - start:.1f}s")
 
 if __name__ == "__main__":
