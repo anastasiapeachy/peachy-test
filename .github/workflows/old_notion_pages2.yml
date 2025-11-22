@@ -1,9 +1,9 @@
-name: Notion Old Pages Report2
+name: Notion Old Pages Report (Debug)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 9 * * *"   # каждый день в 09:00 UTC
+    - cron: "0 9 * * *"
 
 jobs:
   run-report:
@@ -23,18 +23,24 @@ jobs:
           pip install notion-client==2.2.1
           pip install requests
 
-      # -------------------------------------------------------
-      # Phase 1 — Скан Notion + генерация CSV
-      # -------------------------------------------------------
+      # ==========================================
+      # 🔍 DEBUG PHASE 1 — проверяем переменные
+      # ==========================================
+      - name: DEBUG — Check env for Phase 1
+        run: env | sort
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+
+      # ==========================================
+      # Phase 1 — Notion → CSV
+      # ==========================================
       - name: Run Notion Scanner
         run: python notion_old_page_monitor.py
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
 
-      # -------------------------------------------------------
-      # Upload CSV artifact
-      # -------------------------------------------------------
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
         id: upload_csv
@@ -42,9 +48,6 @@ jobs:
           name: notion-old-pages
           path: notion_old_pages.csv
 
-      # -------------------------------------------------------
-      # Получаем URL артефакта
-      # -------------------------------------------------------
       - name: Get Artifact URL
         id: artifact_url
         uses: actions/github-script@v7
@@ -57,14 +60,19 @@ jobs:
               run_id: context.runId
             });
             const artifact = artifacts.data.artifacts.find(a => a.name === "notion-old-pages");
-            if (!artifact) {
-              core.setFailed("Artifact 'notion-old-pages' not found");
-            }
             return `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/artifacts/${artifact.id}`;
 
-      # -------------------------------------------------------
-      # Phase 2 — Slack: сообщение + ссылка на CSV
-      # -------------------------------------------------------
+      # ==========================================
+      # 🔍 DEBUG PHASE 2 — проверяем SLACK_WEBHOOK_URL
+      # ==========================================
+      - name: DEBUG — Check env for Phase 2
+        run: env | sort
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      # ==========================================
+      # Phase 2 — Slack
+      # ==========================================
       - name: Send Slack message
         run: python notion_old_page_monitor.py --artifact-url "${{ steps.artifact_url.outputs.result }}"
         env:
