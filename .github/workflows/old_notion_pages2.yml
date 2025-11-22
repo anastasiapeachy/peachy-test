@@ -69,6 +69,7 @@ jobs:
         run: env | sort
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ARTIFACT_URL: ${{ steps.artifact_url.outputs.result }}
 
       # ==========================================
       # Phase 2 — Slack
@@ -77,3 +78,4 @@ jobs:
         run: python notion_old_page_monitor.py --artifact-url "${{ steps.artifact_url.outputs.result }}"
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ARTIFACT_URL: ${{ steps.artifact_url.outputs.result }}
