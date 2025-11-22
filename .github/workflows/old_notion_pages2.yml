@@ -1,4 +1,4 @@
-name: Notion Old Pages Report
+name: Notion Old Pages Report2
 
 on:
   workflow_dispatch:
