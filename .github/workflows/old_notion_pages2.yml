@@ -62,8 +62,7 @@ jobs:
       # -------------------------------------------------------
       # Phase 2 — Slack (remote.add + share + message)
       # -------------------------------------------------------
-      - name: Send Slack message + attach CSV
-        run: python notion_old_page_monitor.py --artifact-url "${{ steps.artifact_url.outputs.result }}"
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
+- name: Send Slack message + attach CSV
+  run: python notion_old_page_monitor.py --artifact-url "${{ steps.artifact_url.outputs.result }}"
+  env:
+    SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
