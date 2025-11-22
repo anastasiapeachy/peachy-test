@@ -1,9 +1,9 @@
-name: Notion Old Pages Report2
+name: Notion Old Pages Report
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 9 * * *"   # каждый день в 09:00
+    - cron: "0 9 * * *"   # каждый день в 09:00 UTC
 
 jobs:
   run-report:
@@ -24,7 +24,7 @@ jobs:
           pip install requests
 
       # -------------------------------------------------------
-      # Phase 1 — Запуск Python → сбор Notion страниц → CSV
+      # Phase 1 — Скан Notion + генерация CSV
       # -------------------------------------------------------
       - name: Run Notion Scanner
         run: python notion_old_page_monitor.py
@@ -57,12 +57,15 @@ jobs:
               run_id: context.runId
             });
             const artifact = artifacts.data.artifacts.find(a => a.name === "notion-old-pages");
+            if (!artifact) {
+              core.setFailed("Artifact 'notion-old-pages' not found");
+            }
             return `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/artifacts/${artifact.id}`;
 
       # -------------------------------------------------------
-      # Phase 2 — Slack (remote.add + share + message)
+      # Phase 2 — Slack: сообщение + ссылка на CSV
       # -------------------------------------------------------
-      - name: Send Slack message + attach CSV
+      - name: Send Slack message
         run: python notion_old_page_monitor.py --artifact-url "${{ steps.artifact_url.outputs.result }}"
         env:
-         SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
