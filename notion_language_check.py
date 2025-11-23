@@ -18,12 +18,36 @@ if not NOTION_TOKEN or not ROOT_PAGE_ID:
 
 notion = Client(auth=NOTION_TOKEN)
 
+API_DELAY = 0.2       # пауза после каждого запроса
+MAX_RETRIES = 3       # число попыток при rate limit
+
 
 # ===========================================================
-# Helpers: normalize ID
+# SAFE NOTION CALL WRAPPER
 # ===========================================================
 
-def normalize_id(raw_id: str) -> str:
+def notion_call(func, **kwargs):
+    """Обёртка над Notion API c обработкой rate limits."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            res = func(**kwargs)
+            time.sleep(API_DELAY)
+            return res
+        except APIResponseError as e:
+            # Код для rate limit
+            if e.code == "rate_limited" and attempt < MAX_RETRIES - 1:
+                wait = (attempt + 1) * 2
+                print(f"[rate_limit] Sleeping {wait}s and retrying...")
+                time.sleep(wait)
+                continue
+            raise
+
+
+# ===========================================================
+# Utils
+# ===========================================================
+
+def normalize_id(raw_id):
     if not isinstance(raw_id, str):
         return raw_id
     s = raw_id.strip()
@@ -36,37 +60,13 @@ def normalize_id(raw_id: str) -> str:
 ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
 
 
-# ===========================================================
-# Generic Notion call with retry (rate limit + 404)
-# ===========================================================
-
-def with_retry(api_call, *args, **kwargs):
-    """
-    Обертка для Notion API:
-    - 429 → exponential backoff
-    - 404 → вернуть None, а не падать
-    """
-    for attempt in range(5):
-        try:
-            return api_call(*args, **kwargs)
-        except APIResponseError as e:
-            # Rate limit
-            if e.status == 429:
-                wait = 2 ** attempt
-                print(f"[Rate limit] {api_call.__name__}, sleep {wait}s...")
-                time.sleep(wait)
-                continue
-            # Not found / not shared page
-            if e.status == 404:
-                print(f"[Not found] {api_call.__name__}: {e}")
-                return None
-            # other error → пробрасываем
-            raise
-    return None
+def make_url(page_id):
+    clean = page_id.replace("-", "")
+    return f"https://www.notion.so/{clean}"
 
 
 # ===========================================================
-# Fetch all pages in workspace (search API)
+# Fetch all pages in workspace
 # ===========================================================
 
 def get_all_pages_in_workspace():
@@ -74,14 +74,12 @@ def get_all_pages_in_workspace():
     cursor = None
 
     while True:
-        resp = with_retry(
+        resp = notion_call(
             notion.search,
             query="",
             filter={"value": "page", "property": "object"},
             start_cursor=cursor
         )
-        if resp is None:
-            break
 
         pages.extend(resp.get("results", []))
 
@@ -93,7 +91,7 @@ def get_all_pages_in_workspace():
 
 
 # ===========================================================
-# Title / URL helpers
+# Title extractor
 # ===========================================================
 
 def get_title(page):
@@ -103,38 +101,43 @@ def get_title(page):
             parts = [t.get("plain_text", "") for t in prop.get("title", [])]
             if parts:
                 return "".join(parts)
+
+    # fallback через блок child_page (на случай, если properties пустые)
     try:
-        blk = with_retry(notion.blocks.retrieve, block_id=page["id"])
-        if blk and blk.get("type") == "child_page":
+        blk = notion_call(notion.blocks.retrieve, block_id=page["id"])
+        if blk.get("type") == "child_page":
             return blk["child_page"].get("title", "(untitled)")
     except Exception:
         pass
+
     return "(untitled)"
 
 
-def make_url(page_id):
-    clean = page_id.replace("-", "")
-    return f"https://www.notion.so/{clean}"
-
-
 # ===========================================================
-# Blocks fetch (top-level, with pagination)
+# Recursive blocks fetch (без повторных запросов в extractor)
 # ===========================================================
 
-def get_blocks(block_id):
+def get_blocks_recursive(block_id):
+    """
+    Рекурсивно забираем ВСЕ блоки страницы (включая вложенные, колонки, таблицы и т.д.),
+    при этом каждый блок запрашиваем через children.list только один раз.
+    """
     blocks = []
     cursor = None
 
     while True:
-        resp = with_retry(
+        resp = notion_call(
             notion.blocks.children.list,
             block_id=block_id,
             start_cursor=cursor
         )
-        if resp is None:
-            break
 
-        blocks.extend(resp.get("results", []))
+        for block in resp.get("results", []):
+            blocks.append(block)
+
+            # если у блока есть дети — рекурсивно обрабатываем их
+            if block.get("has_children"):
+                blocks.extend(get_blocks_recursive(block["id"]))
 
         if not resp.get("has_more"):
             break
@@ -144,147 +147,73 @@ def get_blocks(block_id):
 
 
 # ===========================================================
-# TEXT EXTRACTION — как в debug, но без print'ов
+# Text extraction per block (как в рабочем дебаге — поменьше, но точнее)
 # ===========================================================
 
 def extract_rich_text(rt_list):
-    """Полный разбор rich_text (plain_text + mentions + href)."""
-    collected = []
+    """Аналог того, что мы использовали в дебаге: аккуратно собираем plain_text."""
+    pieces = []
     for rt in rt_list:
         if not isinstance(rt, dict):
             continue
-
-        # основной текст
         if "plain_text" in rt and rt["plain_text"]:
-            collected.append(rt["plain_text"])
-
-        # mentions — если вдруг есть читаемое имя
-        if rt.get("type") == "mention":
-            m = rt.get("mention", {})
-            if "database" in m and m["database"].get("name"):
-                collected.append(m["database"]["name"])
-            if "page" in m and m["page"].get("title"):
-                collected.append(m["page"]["title"])
-            if "user" in m and m["user"].get("name"):
-                collected.append(m["user"]["name"])
-
-        # ссылки — берем текст ссылки
-        href = rt.get("href")
-        if href and rt.get("plain_text"):
-            collected.append(rt["plain_text"])
-
-    return " ".join(collected)
+            pieces.append(rt["plain_text"])
+    return " ".join(pieces)
 
 
-def extract_all_text_from_block(block):
+def block_own_text(block):
     """
-    Точный экстрактор текста из блока Notion, который мы тестировали
-    на двух страницах (New Reports и MailChimp):
-    - корректно обрабатывает column_list / column
-    - правильно обходит children
-    - учитывает code / caption / tables / callouts / list items и т.д.
+    ВАЖНО: берем ТОЛЬКО текст САМОГО блока, без детей.
+    Дети обрабатываются отдельно через get_blocks_recursive.
+    Это повторяет логику «успешного дебага», где считали по блокам.
     """
     texts = []
-
     btype = block.get("type")
     data = block.get(btype, {}) if btype else {}
 
-    # контейнеры с rich_text
     rich_containers = [
         "paragraph", "heading_1", "heading_2", "heading_3",
         "heading_4", "heading_5", "heading_6",
         "quote", "callout", "bulleted_list_item",
         "numbered_list_item", "toggle", "to_do"
     ]
+
+    # обычные текстовые блоки
     if btype in rich_containers:
         rt = data.get("rich_text", [])
         texts.append(extract_rich_text(rt))
 
-    # code blocks
+    # code
     if btype == "code":
         rt = data.get("rich_text", [])
         texts.append(extract_rich_text(rt))
 
-    # caption (image/file/video)
-    cap = data.get("caption")
-    if cap:
+    # caption (image, file, video, etc.)
+    if isinstance(data, dict) and "caption" in data:
+        cap = data.get("caption", [])
         texts.append(extract_rich_text(cap))
 
     # equation
-    if btype == "equation" and "expression" in data:
-        texts.append(data["expression"])
+    if btype == "equation":
+        expr = data.get("expression")
+        if expr:
+            texts.append(expr)
 
-    # ----- SPECIAL: columns -----
-    if btype in ("column_list", "column"):
-        try:
-            cursor = None
-            while True:
-                resp = with_retry(
-                    notion.blocks.children.list,
-                    block_id=block["id"],
-                    start_cursor=cursor
-                )
-                if resp is None:
-                    break
-                for child in resp.get("results", []):
-                    texts.append(extract_all_text_from_block(child))
-                cursor = resp.get("next_cursor")
-                if not cursor:
-                    break
-        except Exception:
-            pass
-        # для column / column_list выходим сразу,
-        # чтобы не дублить children ниже
-        return " ".join(t for t in texts if t).strip()
+    # table_row — берём текст из ячеек
+    if btype == "table_row":
+        cells = data.get("cells", [])
+        for cell in cells:
+            texts.append(extract_rich_text(cell))
 
-    # ----- tables -----
-    if btype == "table":
-        try:
-            cursor = None
-            while True:
-                resp = with_retry(
-                    notion.blocks.children.list,
-                    block_id=block["id"],
-                    start_cursor=cursor
-                )
-                if resp is None:
-                    break
-                for row in resp.get("results", []):
-                    if row.get("type") == "table_row":
-                        cells = row["table_row"].get("cells", [])
-                        for cell in cells:
-                            texts.append(extract_rich_text(cell))
-                cursor = resp.get("next_cursor")
-                if not cursor:
-                    break
-        except Exception:
-            pass
+    # synced_block: само тело обычно в детях, тут ничего отдельно не считаем
 
-    # ----- generic children recursion -----
-    if block.get("has_children"):
-        try:
-            cursor = None
-            while True:
-                resp = with_retry(
-                    notion.blocks.children.list,
-                    block_id=block["id"],
-                    start_cursor=cursor
-                )
-                if resp is None:
-                    break
-                for child in resp.get("results", []):
-                    texts.append(extract_all_text_from_block(child))
-                cursor = resp.get("next_cursor")
-                if not cursor:
-                    break
-        except Exception:
-            pass
+    # column / column_list — сами по себе текста не несут, только дети → тут пусто
 
     return " ".join(t for t in texts if t).strip()
 
 
 # ===========================================================
-# Parent resolution (чтобы находить страницы под root, в т.ч. в колонках)
+# Parent resolution
 # ===========================================================
 
 def resolve_block_parent_to_page(block_id):
@@ -293,38 +222,27 @@ def resolve_block_parent_to_page(block_id):
         if block_id in visited:
             return None
         visited.add(block_id)
-
-        blk = with_retry(notion.blocks.retrieve, block_id=block_id)
-        if blk is None:
+        try:
+            blk = notion_call(notion.blocks.retrieve, block_id=block_id)
+        except Exception:
             return None
-
         parent = blk.get("parent", {}) or {}
         ptype = parent.get("type")
-
         if ptype == "page_id":
             return normalize_id(parent.get("page_id"))
-
         if ptype == "block_id":
             block_id = parent.get("block_id")
             continue
-
         return None
 
 
 def is_child_of_root(page, root_id, page_index):
-    """
-    Проверяем, является ли страница потомком ROOT_PAGE_ID:
-    - прямой child page
-    - child page внутри блока (в колонках и т.п.)
-    """
     visited = set()
     current = page
-
     while True:
         parent = current.get("parent", {}) or {}
         ptype = parent.get("type")
 
-        # обычный parent page
         if ptype == "page_id":
             pid = normalize_id(parent.get("page_id"))
             if pid == root_id:
@@ -332,84 +250,75 @@ def is_child_of_root(page, root_id, page_index):
             if pid in visited:
                 return False
             visited.add(pid)
-
-            parent_page = page_index.get(pid) or with_retry(
-                notion.pages.retrieve,
-                page_id=pid
-            )
-            if not parent_page:
+            try:
+                current = page_index.get(pid) or notion_call(
+                    notion.pages.retrieve,
+                    page_id=pid
+                )
+            except Exception:
                 return False
-            current = parent_page
             continue
 
-        # parent — блок (column, toggle и т.п.)
-        if ptype == "block_id":
+        elif ptype == "block_id":
             bid = parent.get("block_id")
             resolved = resolve_block_parent_to_page(bid)
-            if not resolved:
-                return False
             if resolved == root_id:
                 return True
-            if resolved in visited:
+            if not resolved or resolved in visited:
                 return False
             visited.add(resolved)
-
-            parent_page = page_index.get(resolved) or with_retry(
-                notion.pages.retrieve,
-                page_id=resolved
-            )
-            if not parent_page:
+            try:
+                current = page_index.get(resolved) or notion_call(
+                    notion.pages.retrieve,
+                    page_id=resolved
+                )
+            except Exception:
                 return False
-            current = parent_page
             continue
 
-        # другие типы parent (database и т.п.) — не считаем
-        return False
+        else:
+            return False
 
 
 # ===========================================================
-# Language helpers (из debug)
+# Language helpers
 # ===========================================================
 
-def detect_lang_safe(text: str) -> str:
+def detect_lang(text):
     try:
         return detect(text)
     except Exception:
         return "unknown"
 
 
-def count_words(text: str) -> int:
+def count_words(text):
     return len(re.findall(r"\b\w+\b", text))
 
 
 # ===========================================================
-# Page analysis — ТОЧНЫЙ, как мы тестировали
+# Analyze page (логика как в удачном дебаге, только обобщённая)
 # ===========================================================
 
 def analyze_page(page_id):
-    """
-    Анализ страницы:
-    - берем все top-level блоки страницы,
-    - для каждого вытаскиваем весь текст (extract_all_text_from_block),
-    - по каждому блоку определяем язык и считаем слова.
-    """
     ru = 0
     en = 0
 
-    blocks = get_blocks(page_id)
+    # берём ВСЕ блоки страницы, включая вложенные, колонки и т.п.
+    blocks = get_blocks_recursive(page_id)
+
     if not blocks:
-        return ru, en
+        return ru, en, True  # ничего не прочитали
 
     for block in blocks:
-        # не спускаемся в child_page — они анализируются как отдельные страницы
+        # не лезем в child_page (другие статьи)
         if block.get("type") == "child_page":
             continue
 
-        text = extract_all_text_from_block(block)
-        if not text or not text.strip():
+        text = block_own_text(block)
+        if not text.strip():
             continue
 
-        lang = detect_lang_safe(text)
+        lang = detect_lang(text)
         words = count_words(text)
 
         if lang == "ru":
@@ -417,7 +326,8 @@ def analyze_page(page_id):
         elif lang == "en":
             en += words
 
-    return ru, en
+    unreadable = (ru + en == 0)
+    return ru, en, unreadable
 
 
 # ===========================================================
@@ -426,6 +336,7 @@ def analyze_page(page_id):
 
 def main():
     start = time.time()
+    unreadable_pages = []
 
     print("Fetching ALL pages in workspace (once)...")
     all_pages = get_all_pages_in_workspace()
@@ -433,65 +344,74 @@ def main():
 
     page_index = {normalize_id(p["id"]): p for p in all_pages}
 
-    # выбираем только root и его потомков
+    # выбираем только root и его потомков (включая страницы в колонках и т.п.)
     selected = []
     for p in all_pages:
         pid = normalize_id(p["id"])
-
         if pid == ROOT_PAGE_ID:
             selected.append(p)
             continue
-
         try:
             if is_child_of_root(p, ROOT_PAGE_ID, page_index):
                 selected.append(p)
         except Exception as e:
-            print(f"Error while checking parent for {pid}: {e}")
+            print(f"Skip page {pid} in is_child_of_root: {e}")
 
     print(f"Total pages under root: {len(selected)}")
 
-    if not selected:
-        print("No pages under root, nothing to analyze.")
-        return
-
     batch_size = 20
     batches = [selected[i:i + batch_size] for i in range(0, len(selected), batch_size)]
+    print(f"Total batches: {len(batches)}, batch size: {batch_size}")
 
     results = []
 
     for bi, batch in enumerate(batches, start=1):
-        print(f"\nProcessing batch {bi}/{len(batches)}, size={len(batch)}")
+        print(f"\nProcessing batch {bi}/{len(batches)} (size={len(batch)})")
 
         for p in batch:
             pid = normalize_id(p["id"])
 
-            page = page_index.get(pid) or with_retry(notion.pages.retrieve, page_id=pid)
-            if not page:
-                print(f"  ⚠ Skip page {pid} (not accessible)")
+            # пробуем достать нормальный объект страницы
+            try:
+                page = page_index.get(pid) or notion_call(
+                    notion.pages.retrieve,
+                    page_id=pid
+                )
+            except APIResponseError as e:
+                # страница недоступна интеграции
+                print(f"Skip page {pid}: {e}")
+                continue
+            except Exception as e:
+                print(f"Skip page {pid}: {e}")
                 continue
 
             title = get_title(page)
             url = make_url(pid)
 
-            # author
+            # автор
             author_info = page.get("created_by", {}) or {}
             author = author_info.get("name")
-
             if not author:
                 uid = author_info.get("id")
                 if uid:
-                    user = with_retry(notion.users.retrieve, user_id=uid)
-                    if user:
+                    try:
+                        user = notion_call(notion.users.retrieve, user_id=uid)
                         author = user.get("name")
-
+                    except Exception:
+                        author = None
             if not author:
                 author = "(unknown)"
 
-            # language analysis
-            ru, en = analyze_page(pid)
+            # анализ текста
+            ru, en, unreadable = analyze_page(pid)
+
+            if unreadable:
+                print(f"⚠ Cannot read page: {title} — {url}")
+                unreadable_pages.append((title, url))
+
             total = ru + en
-            ru_pct = (ru * 100 / total) if total else 0
-            en_pct = (en * 100 / total) if total else 0
+            ru_pct = ru * 100 / total if total else 0
+            en_pct = en * 100 / total if total else 0
 
             results.append({
                 "Page Title": title,
@@ -501,27 +421,32 @@ def main():
                 "% English": round(en_pct, 2),
             })
 
-        # небольшой паузик между батчами (чуть помогает по rate limit)
-        time.sleep(0.5)
+        # небольшая пауза между батчами, чтобы Notion отдохнул
+        time.sleep(1.0)
 
-    if not results:
-        print("No results collected, nothing to save.")
-        return
-
-    # сортировка: сначала по English %, потом по Russian %
-    results.sort(key=lambda x: (x["% English"], x["% Russian"]), reverse=True)
+    # сортировка: по английскому, потом по русскому
+    if results:
+        results.sort(
+            key=lambda x: (x["% English"], x["% Russian"]),
+            reverse=True
+        )
 
     fname = "notion_language_percentages.csv"
     with open(fname, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=["Page Title", "Page URL", "Author", "% Russian", "% English"]
-        )
-        w.writeheader()
-        w.writerows(results)
+        fieldnames = ["Page Title", "Page URL", "Author", "% Russian", "% English"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in results:
+            writer.writerow(row)
 
     print(f"\nSaved {len(results)} rows → {fname}")
-    print(f"Done in {time.time() - start:.1f}s")
+
+    if unreadable_pages:
+        print("\n⚠ Pages that API could NOT read:")
+        for t, u in unreadable_pages:
+            print(f" - {t}: {u}")
+
+    print(f"\nDone in {time.time() - start:.1f}s")
 
 
 if __name__ == "__main__":
