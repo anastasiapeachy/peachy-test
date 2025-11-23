@@ -77,5 +77,8 @@ jobs:
       - name: Send Slack message
         run: python notion_old_page_monitor.py --artifact-url "${{ steps.artifact_url.outputs.result }}"
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          ARTIFACT_URL: ${{ steps.artifact_url.outputs.result }}
+         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+         ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+         SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+         ARTIFACT_URL: ${{ steps.artifact_url.outputs.result }}
+    
