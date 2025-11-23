@@ -3,10 +3,8 @@ import re
 from notion_client import Client
 from langdetect import detect
 
-NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-if not NOTION_TOKEN:
-    raise ValueError("NOTION_TOKEN is not set")
 
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 notion = Client(auth=NOTION_TOKEN)
 
 PAGE_IDS = [
@@ -15,11 +13,22 @@ PAGE_IDS = [
 ]
 
 
-# ================================
-# BASIC HELPERS
-# ================================
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
 def normalize_id(s):
     return s.replace("-", "").strip()
+
+
+def detect_lang_safe(text):
+    try:
+        return detect(text)
+    except:
+        return "unknown"
+
+
+def count_words(t):
+    return len(re.findall(r"\b\w+\b", t))
 
 
 def get_blocks(block_id):
@@ -27,151 +36,116 @@ def get_blocks(block_id):
     cursor = None
     while True:
         resp = notion.blocks.children.list(block_id=block_id, start_cursor=cursor)
-        blocks.extend(resp["results"])
+        blocks.extend(resp.get("results", []))
         if not resp.get("has_more"):
             break
         cursor = resp.get("next_cursor")
     return blocks
 
 
-# ================================
-# TEXT EXTRACTION
-# ================================
+# ---------------------------------------------------------
+# FULL TEXT EXTRACTOR (stable)
+# ---------------------------------------------------------
 def extract_all_text_from_block(block):
-    """
-    Extract absolutely all text from any Notion block,
-    with full recursion and correct column support.
-    """
     texts = []
-
     btype = block.get("type")
     data = block.get(btype, {}) if btype else {}
 
-    # -------- 1. Full rich_text parser --------
-    def extract_rich_text(rt_list):
-        collected = []
+    # ---- helper for rich_text ----
+    def extract_rt(rt_list):
+        out = []
         for rt in rt_list:
             if not isinstance(rt, dict):
                 continue
 
-            # обычный текст
-            if "plain_text" in rt and rt["plain_text"]:
-                collected.append(rt["plain_text"])
+            if "plain_text" in rt:
+                out.append(rt["plain_text"])
 
-            # mentions (страницы, базы, юзеры)
             if rt.get("type") == "mention":
                 m = rt.get("mention", {})
-                # название страницы/базы Notion API в properties не отдаёт,
-                # поэтому тут обычно нечего добавить, но оставляем на будущее.
+                if "page" in m and m["page"].get("title"):
+                    out.append(m["page"]["title"])
+                if "user" in m and m["user"].get("name"):
+                    out.append(m["user"]["name"])
+                if "database" in m and m["database"].get("name"):
+                    out.append(m["database"]["name"])
 
-            # href (ссылки в тексте) — берём текст, а не URL
             href = rt.get("href")
             if href and rt.get("plain_text"):
-                collected.append(rt["plain_text"])
+                out.append(rt["plain_text"])
+        return " ".join(out)
 
-        return " ".join(collected)
-
-    # -------- 2. Rich-text контейнеры --------
+    # ---- standard rich_text containers ----
     rich_containers = [
-        "paragraph", "heading_1", "heading_2", "heading_3",
-        "heading_4", "heading_5", "heading_6",
-        "quote", "callout",
-        "bulleted_list_item", "numbered_list_item",
-        "toggle", "to_do"
+        "paragraph", "heading_1", "heading_2", "heading_3", "heading_4", "heading_5",
+        "quote", "callout", "bulleted_list_item", "numbered_list_item", "toggle", "to_do"
     ]
+
     if btype in rich_containers:
-        rt = data.get("rich_text", [])
-        texts.append(extract_rich_text(rt))
+        texts.append(extract_rt(data.get("rich_text", [])))
 
-    # Code blocks
+    # ---- code blocks ----
     if btype == "code":
-        code_text = data.get("rich_text", [])
-        texts.append(extract_rich_text(code_text))
+        texts.append(extract_rt(data.get("rich_text", [])))
 
-    # Captions (картинки, видео и т.п.)
-    cap = data.get("caption")
-    if cap:
-        texts.append(extract_rich_text(cap))
+    # ---- captions ----
+    if isinstance(data, dict) and "caption" in data:
+        texts.append(extract_rt(data.get("caption", [])))
 
-    # Equations
+    # ---- equations ----
     if btype == "equation" and "expression" in data:
         texts.append(data["expression"])
 
-    # -------- 3. Колонки (главный фикс) --------
+    # ---- COLUMNS ----
     if btype in ("column_list", "column"):
-        try:
-            cursor = None
-            while True:
-                resp = notion.blocks.children.list(
-                    block_id=block["id"], start_cursor=cursor
-                )
-                for child in resp.get("results", []):
-                    texts.append(extract_all_text_from_block(child))
-                cursor = resp.get("next_cursor")
-                if not cursor:
-                    break
-        except Exception:
-            pass
-
-        # ВАЖНО: возвращаем здесь, чтобы не продублировать детей ниже
+        cursor = None
+        while True:
+            resp = notion.blocks.children.list(block_id=block["id"], start_cursor=cursor)
+            for child in resp.get("results", []):
+                texts.append(extract_all_text_from_block(child))
+            cursor = resp.get("next_cursor")
+            if not cursor:
+                break
         return " ".join(t for t in texts if t).strip()
 
-    # -------- 4. Таблицы --------
+    # ---- TABLES ----
     if btype == "table":
-        try:
-            cursor = None
-            while True:
-                resp = notion.blocks.children.list(
-                    block_id=block["id"], start_cursor=cursor
-                )
-                for row in resp.get("results", []):
-                    if row.get("type") == "table_row":
-                        cells = row["table_row"].get("cells", [])
-                        for cell in cells:
-                            texts.append(extract_rich_text(cell))
-                cursor = resp.get("next_cursor")
-                if not cursor:
-                    break
-        except Exception:
-            pass
+        cursor = None
+        while True:
+            resp = notion.blocks.children.list(block_id=block["id"], start_cursor=cursor)
+            for row in resp.get("results", []):
+                if row["type"] == "table_row":
+                    cells = row["table_row"]["cells"]
+                    for cell in cells:
+                        texts.append(extract_rt(cell))
+            cursor = resp.get("next_cursor")
+            if not cursor:
+                break
 
-    # -------- 5. Рекурсия в детей (для всех остальных блоков) --------
+    # ---- generic recursion ----
     if block.get("has_children"):
-        try:
-            cursor = None
-            while True:
-                resp = notion.blocks.children.list(
-                    block_id=block["id"], start_cursor=cursor
-                )
-                for child in resp.get("results", []):
-                    texts.append(extract_all_text_from_block(child))
-                cursor = resp.get("next_cursor")
-                if not cursor:
-                    break
-        except Exception:
-            pass
+        cursor = None
+        while True:
+            resp = notion.blocks.children.list(block_id=block["id"], start_cursor=cursor)
+            for child in resp.get("results", []):
+                texts.append(extract_all_text_from_block(child))
+            cursor = resp.get("next_cursor")
+            if not cursor:
+                break
 
-    # -------- 6. Join --------
     return " ".join(t for t in texts if t).strip()
 
 
-def extract_text(block):
-    """Обёртка, чтобы код выше (print_tree/analyze_page) мог вызывать единое API."""
-    return extract_all_text_from_block(block)
-
-
-# ================================
-# TREE PRINT (для дебага структуры)
-# ================================
+# ---------------------------------------------------------
+# Pretty tree output
+# ---------------------------------------------------------
 def print_tree(block, indent=0):
     pad = " " * indent
-    btype = block["type"]
-    print(f"{pad}- {btype} ({block['id']})")
+    print(f"{pad}- {block['type']} ({block['id']})")
 
-    # Show text if exists
-    text = extract_text(block)
+    text = extract_all_text_from_block(block)
     if text:
-        print(f"{pad}   text: {text[:120]}")  # первые 120 символов
+        print(f"{pad}    text: {text[:160]}")
 
     if block.get("has_children"):
         children = get_blocks(block["id"])
@@ -179,34 +153,13 @@ def print_tree(block, indent=0):
             print_tree(child, indent + 4)
 
 
-# ================================
-# LANGUAGE HELPERS
-# ================================
-_word_re = re.compile(r"\b\w+\b", re.UNICODE)
-
-
-def count_words(text: str) -> int:
-    return len(_word_re.findall(text or ""))
-
-
-def detect_lang_safe(text: str) -> str:
-    # чтобы langdetect не падал на коротких кусках
-    t = (text or "").strip()
-    if len(t) < 3:
-        return "unknown"
-    try:
-        return detect(t)
-    except Exception:
-        return "unknown"
-
-
-# ================================
+# ---------------------------------------------------------
 # PAGE ANALYSIS
-# ================================
+# ---------------------------------------------------------
 def analyze_page(page_id):
-    print("\n" + "=" * 70)
-    print(f"DEBUG PAGE: {page_id}")
-    print("=" * 70)
+    print("\n" + "=" * 80)
+    print(f"DEBUG PAGE {page_id}")
+    print("=" * 80)
 
     page = notion.pages.retrieve(page_id=page_id)
 
@@ -214,51 +167,48 @@ def analyze_page(page_id):
     for prop in page.get("properties", {}).values():
         if prop.get("type") == "title" and prop.get("title"):
             title = prop["title"][0]["plain_text"]
-            break
+
     print(f"Title: {title}")
 
-    print("\n=== BLOCK TREE ===")
     top_blocks = get_blocks(page_id)
+
+    print("\n=== BLOCK TREE ===")
     for b in top_blocks:
         print_tree(b, 0)
 
-    # Полный текст страницы (по всем топ-блокам)
-    print("\n=== FULL PAGE TEXT ===")
-    full_chunks = []
+    print("\n=== FULL EXTRACTED TEXT ===")
+    full_text = []
     for b in top_blocks:
-        full_chunks.append(extract_text(b))
+        full_text.append(extract_all_text_from_block(b))
 
-    full_text = "\n".join(full_chunks)
+    combined = "\n".join(full_text)
+    print(combined[:4000])
 
-    # В логи выводим только первые N символов, чтобы не утонуть,
-    # но анализ ниже идёт по ПОЛНОМУ тексту.
-    print(full_text[:6000])
-
+    # --- language stats ---
     ru = en = 0
-
-    for chunk in full_chunks:
-        if not chunk or not chunk.strip():
+    for chunk in full_text:
+        chunk = chunk.strip()
+        if not chunk:
             continue
         lang = detect_lang_safe(chunk)
         words = count_words(chunk)
-
         if lang == "ru":
             ru += words
         elif lang == "en":
             en += words
 
     total = ru + en
-    print("\n=== LANGUAGE STATS ===")
+    print("\n=== LANGUAGE ===")
     print(f"Russian words: {ru}")
     print(f"English words: {en}")
     print(f"Total: {total}")
-    print(f"RU %: {round(ru / total * 100, 2) if total else 0}")
-    print(f"EN %: {round(en / total * 100, 2) if total else 0}")
+    print(f"RU %: {round(ru/total*100, 2) if total else 0}")
+    print(f"EN %: {round(en/total*100, 2) if total else 0}")
 
 
-# ================================
+# ---------------------------------------------------------
 # RUN
-# ================================
+# ---------------------------------------------------------
 if __name__ == "__main__":
     for pid in PAGE_IDS:
         analyze_page(pid)
