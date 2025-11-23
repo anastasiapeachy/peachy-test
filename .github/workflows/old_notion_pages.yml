@@ -3,7 +3,7 @@ name: Notion Old Pages Report
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 9 * * *"   # каждый день в 09:00 UTC
+    - cron: "0 9 1 */2 *"
 
 jobs:
   run-report:
@@ -24,7 +24,7 @@ jobs:
           pip install requests
 
       # -------------------------------------------------------
-      # Phase 1 — Запуск Notion Scanner → CSV + count.json
+      # 1 — Notion Scanner → CSV + count.json
       # -------------------------------------------------------
       - name: Run Notion Scanner
         run: python notion_old_page_monitor.py
@@ -44,7 +44,7 @@ jobs:
           path: notion_old_pages.csv
 
       # -------------------------------------------------------
-      # Получаем URL артефакта
+      # Get artifact URL
       # -------------------------------------------------------
       - name: Get Artifact URL
         id: artifact_url
@@ -64,7 +64,7 @@ jobs:
             return `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/artifacts/${artifact.id}`;
 
       # -------------------------------------------------------
-      # Phase 2 — Slack Notification
+      # 2 — Slack Notification
       # -------------------------------------------------------
       - name: Send Slack message
         run: python notion_old_page_monitor.py --artifact-url "${{ steps.artifact_url.outputs.result }}"
