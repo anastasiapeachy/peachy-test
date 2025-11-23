@@ -50,55 +50,121 @@ def print_tree(block, indent=0):
 # ================================
 # TEXT EXTRACTION
 # ================================
-def extract_text(block):
-    parts = []
+def extract_all_text_from_block(block):
+    """Extract absolutely all text from any Notion block, with full recursion and column support."""
+    texts = []
 
-    btype = block["type"]
-    data = block.get(btype, {})
+    btype = block.get("type")
+    data = block.get(btype, {}) if btype else {}
 
-    # rich_text content
-    if isinstance(data, dict) and "rich_text" in data:
-        parts.append(" ".join(t.get("plain_text", "") for t in data["rich_text"]))
+    # ========= 1. FULL RICH TEXT PARSER =========
+    def extract_rich_text(rt_list):
+        collected = []
+        for rt in rt_list:
+            if not isinstance(rt, dict):
+                continue
 
-    # caption
-    if isinstance(data, dict) and "caption" in data:
-        parts.append(" ".join(t.get("plain_text", "") for t in data["caption"]))
+            # plain text (normal case)
+            if "plain_text" in rt:
+                collected.append(rt["plain_text"])
 
-    # synced_block → load original
-    if btype == "synced_block":
-        sf = data.get("synced_from")
-        if sf and sf.get("block_id"):
-            orig = sf["block_id"]
-            children = get_blocks(orig)
-            for c in children:
-                parts.append(extract_text(c))
+            # mention text
+            if rt.get("type") == "mention":
+                m = rt.get("mention", {})
+                if "database" in m and m["database"].get("name"):
+                    collected.append(m["database"]["name"])
+                if "page" in m and m["page"].get("title"):
+                    collected.append(m["page"]["title"])
+                if "user" in m and m["user"].get("name"):
+                    collected.append(m["user"]["name"])
 
-    # table
+            # href text (inline links)
+            href = rt.get("href")
+            if href and rt.get("plain_text"):
+                collected.append(rt["plain_text"])
+
+        return " ".join(collected)
+
+    # ========= 2. HANDLE ALL BLOCK TYPES =========
+
+    # Paragraphs, headings, calls, list items, etc.
+    rich_containers = [
+        "paragraph", "heading_1", "heading_2", "heading_3", "heading_4", "heading_5", "heading_6",
+        "quote", "callout", "bulleted_list_item", "numbered_list_item",
+        "toggle", "to_do"
+    ]
+    if btype in rich_containers:
+        rt = data.get("rich_text", [])
+        texts.append(extract_rich_text(rt))
+
+    # Code blocks
+    if btype == "code":
+        code_text = data.get("rich_text", [])
+        texts.append(extract_rich_text(code_text))
+
+    # Captions (images, files, videos…)
+    cap = data.get("caption")
+    if cap:
+        texts.append(extract_rich_text(cap))
+
+    # Equations
+    if btype == "equation" and "expression" in data:
+        texts.append(data["expression"])
+
+    # ========= 3. SPECIAL HANDLING: COLUMNS =========
+
+    if btype in ("column_list", "column"):
+        # fetch children of the column
+        try:
+            cursor = None
+            while True:
+                resp = notion.blocks.children.list(block_id=block["id"], start_cursor=cursor)
+                for child in resp.get("results", []):
+                    texts.append(extract_all_text_from_block(child))
+                cursor = resp.get("next_cursor")
+                if not cursor:
+                    break
+        except:
+            pass
+
+        return " ".join(t for t in texts if t).strip()
+
+    # ========= 4. TABLES =========
+
     if btype == "table":
-        rows = get_blocks(block["id"])
-        for row in rows:
-            cells = row.get("table_row", {}).get("cells", [])
-            for cell in cells:
-                parts.append(" ".join(t.get("plain_text", "") for t in cell))
+        try:
+            cursor = None
+            while True:
+                resp = notion.blocks.children.list(block_id=block["id"], start_cursor=cursor)
+                for row in resp.get("results", []):
+                    if row.get("type") == "table_row":
+                        cells = row["table_row"]["cells"]
+                        for cell in cells:
+                            texts.append(extract_rich_text(cell))
+                cursor = resp.get("next_cursor")
+                if not cursor:
+                    break
+        except:
+            pass
 
-    # recursion for child blocks
+    # ========= 5. RECURSE INTO CHILDREN IF ANY =========
+
     if block.get("has_children"):
-        children = get_blocks(block["id"])
-        for child in children:
-            parts.append(extract_text(child))
+        try:
+            cursor = None
+            while True:
+                resp = notion.blocks.children.list(block_id=block["id"], start_cursor=cursor)
+                for child in resp.get("results", []):
+                    texts.append(extract_all_text_from_block(child))
+                cursor = resp.get("next_cursor")
+                if not cursor:
+                    break
+        except:
+            pass
 
-    return " ".join(p for p in parts if p).strip()
+    # ========= 6. JOIN RESULT =========
 
-
-def count_words(text):
-    return len(re.findall(r"\b\w+\b", text))
-
-
-def detect_lang_safe(text):
-    try:
-        return detect(text)
-    except:
-        return "unknown"
+    return " ".join(t for t in texts if t).strip()
 
 
 # ================================
