@@ -11,13 +11,13 @@ jobs:
 
     steps:
       # ===============================
-      # Checkout repository
+      # CHECKOUT REPO
       # ===============================
       - name: Checkout repo
         uses: actions/checkout@v4
 
       # ===============================
-      # Python setup
+      # PYTHON SETUP
       # ===============================
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,16 +25,16 @@ jobs:
           python-version: "3.11"
 
       # ===============================
-      # Install dependencies WITHOUT requirements.txt
+      # INSTALL DEPENDENCIES (NO requirements.txt)
       # ===============================
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install notion-client==2.2.1
           pip install requests==2.31.0
 
       # ===============================
-      # Restore cache (known pages)
+      # RESTORE CACHE
       # ===============================
       - name: Restore known pages cache
         id: cache-known
@@ -43,10 +43,11 @@ jobs:
           path: notion_tracker_data/known_pages.json
           key: known-pages-cache
           restore-keys: |
+            known-pages-cache
             known-pages-
 
       # ===============================
-      # Run Notion scanner
+      # RUN TRACKER
       # ===============================
       - name: Run Notion tracker
         env:
@@ -58,7 +59,7 @@ jobs:
           python notion_tracker_slack.py
 
       # ===============================
-      # Save cache
+      # SAVE CACHE BACK
       # ===============================
       - name: Save known pages cache
         if: always()
