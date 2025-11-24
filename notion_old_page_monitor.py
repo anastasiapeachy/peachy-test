@@ -8,14 +8,15 @@ import csv
 import json
 import argparse
 
+
 # ======================================================
-# Phase 2 argument: --artifact-url (больше не нужен, но обязателен для запуска Phase 2)
+# Phase 2 argument trigger
 # ======================================================
 parser = argparse.ArgumentParser()
 parser.add_argument("--artifact-url", default=None)
 args = parser.parse_args()
 
-ARTIFACT_URL = args.artifact_url  # просто триггер Phase 2
+ARTIFACT_URL = args.artifact_url  # just a flag to trigger Phase 2
 
 
 # ======================================================
@@ -27,23 +28,24 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL")
 
 if not NOTION_TOKEN:
-    raise ValueError("NOTION_TOKEN is not set")
+    raise ValueError("NOTION_TOKEN not set")
 if not ROOT_PAGE_ID:
-    raise ValueError("ROOT_PAGE_ID is not set")
+    raise ValueError("ROOT_PAGE_ID not set")
 
 notion = Client(auth=NOTION_TOKEN)
+
 ONE_YEAR_AGO = datetime.now(timezone.utc) - timedelta(days=365)
 
 
 # ======================================================
-# Robust request wrapper (handles 429 + 5xx)
+# Safe request wrapper for Notion (handles 429 & 5xx)
 # ======================================================
 def safe_request(func, *args, **kwargs):
-    max_retries = 8
-    delay = 0.3
+    retries = 7
+    delay = 0.25
     backoff = 1
 
-    for attempt in range(max_retries):
+    for attempt in range(retries):
         try:
             time.sleep(delay)
             return func(*args, **kwargs)
@@ -54,21 +56,20 @@ def safe_request(func, *args, **kwargs):
             # Rate limit
             if status == 429:
                 retry_after = int(getattr(e, "headers", {}).get("Retry-After", 1))
-                print(f"[429] Rate limit exceeded. Waiting {retry_after}s...")
+                print(f"[429] Rate limited → waiting {retry_after}s…")
                 time.sleep(retry_after)
                 continue
 
             # Server errors
             if 500 <= status <= 599:
-                print(f"[{status}] Server error. Retrying in {backoff}s...")
+                print(f"[{status}] Server error → retry in {backoff}s…")
                 time.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                backoff = min(backoff * 2, 20)
                 continue
 
-            # Other errors
             raise
 
-    raise RuntimeError("Notion API not responding after retries")
+    raise RuntimeError("Notion did not respond after retries")
 
 
 # ======================================================
@@ -82,15 +83,16 @@ def notion_url(page_id):
 def get_page_info(page_id):
     page = safe_request(notion.pages.retrieve, page_id=page_id)
 
+    # Title
     title = "Untitled"
-    if "properties" in page:
-        for prop in page["properties"].values():
-            if prop["type"] == "title" and prop.get("title"):
-                title = prop["title"][0]["plain_text"]
-                break
+    for prop in page.get("properties", {}).values():
+        if prop["type"] == "title" and prop.get("title"):
+            title = prop["title"][0]["plain_text"]
+            break
 
+    # Last edited
     last_raw = page.get("last_edited_time", "")
-    last_dt = datetime.fromisoformat(last_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+    last_dt = datetime.fromisoformat(last_raw.replace("Z", "+00:00"))
 
     return {
         "id": page_id,
@@ -111,7 +113,6 @@ def get_block_children(block_id):
             start_cursor=cursor
         )
         blocks.extend(resp.get("results", []))
-
         cursor = resp.get("next_cursor")
         if not cursor:
             break
@@ -132,7 +133,6 @@ def get_database_pages(database_id):
             start_cursor=cursor
         )
         pages.extend(resp.get("results", []))
-
         cursor = resp.get("next_cursor")
         if not cursor:
             break
@@ -143,12 +143,12 @@ def get_database_pages(database_id):
 
 
 # ======================================================
-# Empty page detection (DB rows with only title)
+# Detect EMPTY database rows
 # ======================================================
 def is_empty_page(page_id):
     """
-    Страница считается пустой, если нет НИ ОДНОГО блока контента.
-    Наличие title НЕ делает страницу непустой.
+    A page is considered empty if it has no content blocks.
+    Title alone does NOT count as content.
     """
     try:
         children = get_block_children(page_id)
@@ -158,7 +158,7 @@ def is_empty_page(page_id):
 
 
 # ======================================================
-# Full recursive traversal
+# FULL recursive Notion traversal
 # ======================================================
 def get_all_pages(block_id):
     pages = []
@@ -167,9 +167,7 @@ def get_all_pages(block_id):
     for block in children:
         btype = block["type"]
 
-        # ------------------------------
-        # child_page
-        # ------------------------------
+        # ------------------------- PAGE -------------------------
         if btype == "child_page":
             pid = block["id"]
             try:
@@ -179,9 +177,7 @@ def get_all_pages(block_id):
             except Exception as e:
                 print(f"Skip child_page {pid}: {e}")
 
-        # ------------------------------
-        # child_database
-        # ------------------------------
+        # ---------------------- DATABASE ------------------------
         elif btype == "child_database":
             db_id = block["id"]
             try:
@@ -189,9 +185,8 @@ def get_all_pages(block_id):
                 for db_page in db_pages:
                     pid = db_page["id"]
 
-                    # ❗ skip empty database rows
                     if is_empty_page(pid):
-                        print(f"Skip empty database page: {pid}")
+                        print(f"Skip empty DB page: {pid}")
                         continue
 
                     try:
@@ -199,14 +194,12 @@ def get_all_pages(block_id):
                         pages.append(info)
                         pages.extend(get_all_pages(pid))
                     except Exception as e:
-                        print(f"Skip db page {pid}: {e}")
+                        print(f"Skip db row {pid}: {e}")
 
             except Exception as e:
-                print(f"Skip child_database {db_id}: {e}")
+                print(f"Skip database {db_id}: {e}")
 
-        # ------------------------------
-        # Any nested block
-        # ------------------------------
+        # ----------------------- NESTED BLOCKS -------------------
         if block.get("has_children") and btype not in ("child_page", "child_database"):
             try:
                 pages.extend(get_all_pages(block["id"]))
@@ -217,49 +210,49 @@ def get_all_pages(block_id):
 
 
 # ======================================================
-# Slack upload (files.upload)
+# SLACK LEGACY FILE UPLOAD (the ONLY working API)
 # ======================================================
-def upload_file_to_slack(filepath, message):
+def slack_upload_file(filepath, message):
     token = SLACK_BOT_TOKEN
     channel = SLACK_CHANNEL
 
     if not token or not channel:
-        print("Slack token or channel missing — skipping file upload.")
+        print("Slack env vars missing → skip upload")
         return
 
-    print(f"Uploading {filepath} to Slack...")
+    print(f"Uploading {filepath} → Slack (legacy)…")
 
     with open(filepath, "rb") as f:
         resp = requests.post(
-            "https://slack.com/api/files.upload",
+            "https://slack.com/api/chat.postMessage",
             headers={"Authorization": f"Bearer {token}"},
-            data={"channels": channel, "initial_comment": message},
-            files={"file": f},
-            timeout=30
+            data={"channel": channel, "text": message},
+            files={"file": (os.path.basename(filepath), f, "text/csv")}
         )
+
+    print("Slack upload response:", resp.status_code, resp.text)
 
     try:
         data = resp.json()
-        print("Slack upload response:", data)
         if not data.get("ok"):
             print("Slack upload error:", data.get("error"))
     except Exception as e:
-        print("Slack upload parse error:", e)
+        print("Slack parse error:", e)
 
 
 # ======================================================
-# Phase 1 — scan and CSV
+# Phase 1 — SCAN + CSV
 # ======================================================
 def generate_csv_and_count():
-    print("Scanning Notion deeply...")
+    print("Scanning Notion deeply…")
     pages = get_all_pages(ROOT_PAGE_ID)
-    print(f"Total discovered pages: {len(pages)}")
+    print(f"Total pages discovered: {len(pages)}")
 
     old_pages = [
         {
             "title": p["title"],
             "last_edited": p["last_edited"].isoformat(),
-            "url": p["url"],
+            "url": p["url"]
         }
         for p in pages
         if p["last_edited"] < ONE_YEAR_AGO
@@ -269,43 +262,40 @@ def generate_csv_and_count():
     print(f"Old pages found: {len(old_pages)}")
 
     with open("notion_old_pages.csv", "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["title", "last_edited", "url"])
+        writer = csv.writer(f)
+        writer.writerow(["title", "last_edited", "url"])
         for p in old_pages:
-            w.writerow([p["title"], p["last_edited"], p["url"]])
+            writer.writerow([p["title"], p["last_edited"], p["url"]])
 
     with open("notion_old_pages_count.json", "w", encoding="utf-8") as f:
-        json.dump({"count": len(old_pages)}, f, ensure_ascii=False)
+        json.dump({"count": len(old_pages)}, f)
 
     print("CSV saved.")
 
 
 # ======================================================
-# Phase 2 — Slack
+# Phase 2 — SLACK
 # ======================================================
 def notify_slack():
     try:
-        with open("notion_old_pages_count.json", "r", encoding="utf-8") as f:
+        with open("notion_old_pages_count.json", "r") as f:
             total = json.load(f)["count"]
-    except FileNotFoundError:
-        print("No count.json — skip Slack.")
+    except:
+        print("count.json missing → skip Slack")
         return
 
-    # Skip if no old pages
     if total == 0:
-        print("No old pages — Slack message skipped.")
+        print("No old pages → no Slack message")
         return
 
     message = f"📄 Найдено *{total}* страниц, которые не редактировались больше года."
-    upload_file_to_slack("notion_old_pages.csv", message)
+    slack_upload_file("notion_old_pages.csv", message)
 
 
 # ======================================================
 # MAIN
 # ======================================================
 if ARTIFACT_URL:
-    # Phase 2
     notify_slack()
 else:
-    # Phase 1
     generate_csv_and_count()
