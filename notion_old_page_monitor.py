@@ -134,10 +134,6 @@ def get_database_pages(database_id):
 # EMPTY PAGE CHECK (for database rows)
 # ======================================================
 def is_empty_page(page_id):
-    """
-    Страница считается пустой, если нет ни одного блока контента.
-    Наличие title НЕ делает страницу непустой.
-    """
     try:
         children = get_block_children(page_id)
         if len(children) == 0:
@@ -178,7 +174,6 @@ def get_all_pages(block_id):
                 for db_page in db_pages:
                     pid = db_page["id"]
 
-                    # ⛔ PRO SKIP: empty database pages
                     try:
                         if is_empty_page(pid):
                             print(f"Skip empty database page: {pid}")
@@ -215,8 +210,8 @@ def send_slack_webhook(total, artifact_url):
         return
 
     text = (
-        f"📄 Найдено *{total}* страниц, которые не редактировались больше года.\n"
-        f"📎 CSV отчёт: {artifact_url}"
+        f"📄 Found *{total}* pages in Notion that haven’t been edited for over a year.\n"
+        f"📎 CSV report: {artifact_url}"
     )
 
     try:
