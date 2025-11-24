@@ -7,279 +7,274 @@ from datetime import datetime, timezone, timedelta
 import csv
 import json
 import argparse
-import base64
 
-
-# ======================================================
-# Phase 2 argument trigger
-# ======================================================
+# ===== Args =====
 parser = argparse.ArgumentParser()
-parser.add_argument("--release-upload-url", default=None)
+parser.add_argument("--artifact-url", default=None)
 args = parser.parse_args()
 
-RELEASE_UPLOAD_URL = args.release_upload_url  # triggers Phase 2
+ARTIFACT_URL = args.artifact_url
 
-
-# ======================================================
-# ENV
-# ======================================================
+# ===== Environment =====
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
-
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY")
-
-if not NOTION_TOKEN:
-    raise ValueError("NOTION_TOKEN not set")
-if not ROOT_PAGE_ID:
-    raise ValueError("ROOT_PAGE_ID not set")
-if not GITHUB_TOKEN:
-    raise ValueError("GITHUB_TOKEN not set")
-if not GITHUB_REPOSITORY:
-    raise ValueError("GITHUB_REPOSITORY not set")
-
-notion = Client(auth=NOTION_TOKEN)
-ONE_YEAR_AGO = datetime.now(timezone.utc) - timedelta(days=365)
+# NOTION инициализируем ТОЛЬКО в фазе сканирования
+if ARTIFACT_URL is None:
+    if not NOTION_TOKEN:
+        raise ValueError("NOTION_TOKEN is not set")
+    if not ROOT_PAGE_ID:
+        raise ValueError("ROOT_PAGE_ID is not set")
+    notion = Client(auth=NOTION_TOKEN)
+    ONE_YEAR_AGO = datetime.now(timezone.utc) - timedelta(days=365)
+else:
+    notion = None
+    ONE_YEAR_AGO = None
 
 
 # ======================================================
-# Safe Notion wrapper
+# Helpers
 # ======================================================
+
+def notion_url(page_id: str) -> str:
+    clean = page_id.replace("-", "")
+    return f"https://www.notion.so/{clean}"
+
+
 def safe_request(func, *args, **kwargs):
-    retries = 7
-    delay = 0.25
+    """
+    Безопасный вызов Notion API:
+    - retry на 429 (rate limit)
+    - retry на 5xx (временные ошибки Notion)
+    - экспоненциальный backoff
+    """
+    max_retries = 10
+    base_delay = 0.25
     backoff = 1
 
-    for _ in range(retries):
+    for attempt in range(max_retries):
         try:
-            time.sleep(delay)
+            time.sleep(base_delay)
             return func(*args, **kwargs)
         except APIResponseError as e:
-            if e.status == 429:
-                wait = int(getattr(e, "headers", {}).get("Retry-After", 1))
-                print(f"[429] Rate limit → {wait}s")
-                time.sleep(wait)
+            status = e.status
+            # 429 — слишком много запросов
+            if status == 429:
+                retry_after = int(getattr(e, "headers", {}).get("Retry-After", 1))
+                print(f"[429] Rate limit. Waiting {retry_after}s...")
+                time.sleep(retry_after)
                 continue
-            if 500 <= e.status <= 599:
-                print(f"[{e.status}] Retry in {backoff}s")
+            # 5xx — глюки Notion
+            if 500 <= status <= 599:
+                print(f"[{status}] Notion internal error. Retry in {backoff}s...")
                 time.sleep(backoff)
-                backoff = min(backoff * 2, 20)
+                backoff = min(backoff * 2, 30)
                 continue
+            # Остальное — фатально
             raise
-    raise RuntimeError("Notion retries exceeded")
-
-
-# ======================================================
-# Notion helpers
-# ======================================================
-def notion_url(page_id):
-    return f"https://www.notion.so/{page_id.replace('-', '')}"
+    raise RuntimeError("Too many retries — Notion API not responding.")
 
 
 def get_page_info(page_id):
-    page = safe_request(notion.pages.retrieve, page_id=page_id)
+    page = safe_request(notion.pages.retrieve, page_id)
     title = "Untitled"
 
-    for prop in page.get("properties", {}).values():
-        if prop["type"] == "title" and prop.get("title"):
-            title = prop["title"][0]["plain_text"]
-            break
+    if "properties" in page:
+        for prop in page["properties"].values():
+            if prop["type"] == "title" and prop.get("title"):
+                title = prop["title"][0]["plain_text"]
+                break
 
-    last = datetime.fromisoformat(
-        page["last_edited_time"].replace("Z", "+00:00")
-    )
+    last_raw = page.get("last_edited_time", "")
+    last_dt = datetime.fromisoformat(last_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
 
     return {
         "id": page_id,
         "title": title,
         "url": notion_url(page_id),
-        "last_edited": last
+        "last_edited": last_dt,
     }
 
 
-def get_block_children(block_id):
-    blocks = []
+def is_page_empty(page_id: str) -> bool:
+    """
+    Считаем страницу "пустой", если у неё нет ни одного блока-контента.
+    (Т.е. страницы из database только с заголовком, но без текста, будут отфильтрованы.)
+    """
+    resp = safe_request(
+        notion.blocks.children.list,
+        block_id=page_id,
+        page_size=1  # достаточно проверить, что первый блок вообще существует
+    )
+    results = resp.get("results", [])
+    return len(results) == 0
+
+
+# ======================================================
+# Глубокий обход всех потомков ROOT_PAGE_ID
+# ======================================================
+
+def get_all_pages(block_id):
+    pages = []
     cursor = None
+
     while True:
         resp = safe_request(
             notion.blocks.children.list,
             block_id=block_id,
             start_cursor=cursor
         )
-        blocks.extend(resp["results"])
+
+        for block in resp["results"]:
+            btype = block["type"]
+
+            # 1) child_page → полноценная страница
+            if btype == "child_page":
+                pid = block["id"]
+                try:
+                    info = get_page_info(pid)
+                    pages.append(info)
+                    # рекурсивно уходим внутрь
+                    pages.extend(get_all_pages(pid))
+                except Exception as e:
+                    print(f"Skipping page {pid}: {e}")
+
+            # 2) Любой блок с has_children → сканируем детей
+            if block.get("has_children", False):
+                try:
+                    pages.extend(get_all_pages(block["id"]))
+                except Exception as e:
+                    print(f"Skipping children of {block['id']}: {e}")
+
+            # 3) Дополнительно углубляемся по типам, которые часто прячут вложенные страницы
+            if btype in [
+                "column", "column_list",
+                "bulleted_list_item", "numbered_list_item",
+                "toggle", "to_do", "synced_block",
+                "paragraph", "quote", "callout"
+            ]:
+                try:
+                    pages.extend(get_all_pages(block["id"]))
+                except Exception as e:
+                    print(f"Deep scan skip for {block['id']}: {e}")
+
         cursor = resp.get("next_cursor")
         if not cursor:
             break
-        time.sleep(0.1)
-    return blocks
 
-
-def is_empty_page(page_id):
-    try:
-        kids = get_block_children(page_id)
-        return len(kids) == 0
-    except:
-        return False
-
-
-# ======================================================
-# Full Notion traversal
-# ======================================================
-def get_all_pages(block_id):
-    pages = []
-    for block in get_block_children(block_id):
-        btype = block["type"]
-
-        # Page
-        if btype == "child_page":
-            pid = block["id"]
-            try:
-                info = get_page_info(pid)
-                pages.append(info)
-                pages.extend(get_all_pages(pid))
-            except:
-                pass
-
-        # Database
-        if btype == "child_database":
-            db_id = block["id"]
-            try:
-                resp = safe_request(notion.databases.query, database_id=db_id)
-                for row in resp["results"]:
-                    pid = row["id"]
-                    if is_empty_page(pid):
-                        print(f"Skip empty DB row {pid}")
-                        continue
-                    info = get_page_info(pid)
-                    pages.append(info)
-                    pages.extend(get_all_pages(pid))
-            except:
-                pass
-
-        # Nested blocks
-        if block.get("has_children") and btype not in ("child_page", "child_database"):
-            try:
-                pages.extend(get_all_pages(block["id"]))
-            except:
-                pass
+        time.sleep(0.15)
 
     return pages
 
 
 # ======================================================
-# GitHub Release upload (public assets)
+# Phase 1 — scan Notion & generate CSV
 # ======================================================
-def upload_to_release_and_get_public_url(filepath):
-    owner, repo = GITHUB_REPOSITORY.split("/")
 
-    # 1) Find/create release
-    rel_name = "notion-old-pages"
-    print("Ensuring release exists...")
-
-    # Get release by tag
-    rel = requests.get(
-        f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{rel_name}",
-        headers={"Authorization": f"Bearer {GITHUB_TOKEN}"}
-    )
-
-    if rel.status_code == 404:
-        print("Creating release...")
-        rel = requests.post(
-            f"https://api.github.com/repos/{owner}/{repo}/releases",
-            headers={"Authorization": f"Bearer {GITHUB_TOKEN}"},
-            json={"tag_name": rel_name, "name": rel_name, "draft": False, "prerelease": False}
-        )
-
-    release = rel.json()
-    upload_url = release["upload_url"].split("{")[0]
-
-    print("Uploading CSV asset...")
-
-    with open(filepath, "rb") as f:
-        content = f.read()
-
-    resp = requests.post(
-        f"{upload_url}?name=notion_old_pages.csv",
-        headers={
-            "Authorization": f"Bearer {GITHUB_TOKEN}",
-            "Content-Type": "text/csv"
-        },
-        data=content
-    )
-
-    asset = resp.json()
-    public_url = asset["browser_download_url"]
-
-    print("Public URL:", public_url)
-    return public_url
-
-
-# ======================================================
-# Slack notify
-# ======================================================
-def slack_notify(public_url, total):
-    if not SLACK_WEBHOOK_URL:
-        print("Slack webhook missing — skip")
-        return
-
-    message = (
-        f"📄 Найдено *{total}* страниц, которые не редактировались больше года.\n"
-        f"📎 CSV: {public_url}"
-    )
-
-    resp = requests.post(
-        SLACK_WEBHOOK_URL,
-        json={"text": message}
-    )
-
-    print("Slack response:", resp.status_code, resp.text)
-
-
-# ======================================================
-# Phase 1 — Notion scan
-# ======================================================
 def generate_csv_and_count():
+    print("Scanning Notion deeply...")
     pages = get_all_pages(ROOT_PAGE_ID)
-    print(f"Total pages: {len(pages)}")
+    print(f"Total discovered pages (including empty): {len(pages)}")
 
-    old = [
-        p for p in pages if p["last_edited"] < ONE_YEAR_AGO
-    ]
+    old_pages = []
 
-    old.sort(key=lambda x: x["last_edited"])
-    print(f"Old pages: {len(old)}")
+    for p in pages:
+        # игнорируем пустые страницы (только заголовок, нет контента)
+        try:
+            if is_page_empty(p["id"]):
+                continue
+        except Exception as e:
+            print(f"Failed emptiness check for {p['id']}: {e}")
 
+        if p["last_edited"] < ONE_YEAR_AGO:
+            old_pages.append({
+                "title": p["title"],
+                "last_edited": p["last_edited"].isoformat(),
+                "url": p["url"]
+            })
+
+    # сортировка: самые старые наверху
+    old_pages.sort(key=lambda x: x["last_edited"])
+    print(f"Old non-empty pages found: {len(old_pages)}")
+
+    # CSV только со старыми непустыми страницами
     with open("notion_old_pages.csv", "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["title", "last_edited", "url"])
-        for p in old:
-            w.writerow([p["title"], p["last_edited"].isoformat(), p["url"]])
+        for p in old_pages:
+            w.writerow([p["title"], p["last_edited"], p["url"]])
 
-    with open("notion_old_pages_count.json", "w") as f:
-        json.dump({"count": len(old)}, f)
+    # Сохраняем количество для второй фазы
+    with open("notion_old_pages_count.json", "w", encoding="utf-8") as f:
+        json.dump({"count": len(old_pages)}, f, ensure_ascii=False)
+
+    print("CSV saved")
 
 
 # ======================================================
-# Phase 2 — Slack via public GitHub Release URL
+# Phase 2 — Slack notification (через Webhook)
 # ======================================================
-def phase2():
-    with open("notion_old_pages_count.json") as f:
-        total = json.load(f)["count"]
 
-    if total == 0:
-        print("No old pages → no Slack")
+def notify_slack(artifact_url: str):
+    if not SLACK_WEBHOOK_URL:
+        print("SLACK_WEBHOOK_URL missing, skip Slack.")
         return
 
-    url = upload_to_release_and_get_public_url("notion_old_pages.csv")
-    slack_notify(url, total)
+    # читаем количество страниц
+    try:
+        with open("notion_old_pages_count.json", "r", encoding="utf-8") as f:
+            total = json.load(f)["count"]
+    except Exception as e:
+        print(f"Cannot read notion_old_pages_count.json: {e}")
+        return
+
+    # условие: если 0 → не слать вообще
+    if total == 0:
+        print("No old pages found — skipping Slack.")
+        return
+
+    text = f"📄 Найдено *{total}* страниц, которые не редактировались больше года."
+
+    # "человеческий" блок с кнопкой Download CSV
+    blocks = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": text}
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Download CSV"},
+                    "url": artifact_url,
+                    "style": "primary"
+                }
+            ]
+        }
+    ]
+
+    payload = {"blocks": blocks}
+
+    print("Sending Slack message...")
+    resp = requests.post(SLACK_WEBHOOK_URL, json=payload)
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw": resp.text}
+
+    print(f"Slack status: {resp.status_code}")
+    print(f"Slack response: {data}")
 
 
 # ======================================================
 # MAIN
 # ======================================================
-if RELEASE_UPLOAD_URL:
-    phase2()
+
+if ARTIFACT_URL:
+    # Phase 2 — только Slack, без Notion
+    notify_slack(ARTIFACT_URL)
 else:
+    # Phase 1 — только Notion + CSV + count.json
     generate_csv_and_count()
