@@ -1,10 +1,10 @@
-name: Slack Upload V2 Test
+name: Slack Upload External Test
 
 on:
   workflow_dispatch:
 
 jobs:
-  slack-test:
+  slack-test-external:
     runs-on: ubuntu-latest
 
     steps:
@@ -20,8 +20,8 @@ jobs:
         run: |
           pip install requests
 
-      - name: Run Slack upload V2 test
-        run: python slack_test_upload_v2.py
+      - name: Run Slack external upload test
+        run: python slack_test_upload_external.py
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
