@@ -21,7 +21,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install notion-client langdetect
 
-      - name: Run analysis
+      - name: Run language analysis
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
