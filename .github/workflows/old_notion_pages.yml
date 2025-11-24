@@ -3,7 +3,7 @@ name: Notion Old Pages Report
 on:
   workflow_dispatch:
   schedule:
-    # первый запуск 1 декабря, затем каждые два месяца
+    # Запускается 1 декабря, 1 февраля, 1 апреля, 1 июня, 1 августа, 1 октября — в 09:00 UTC
     - cron: "0 9 1 12,2,4,6,8,10 *"
 
 jobs:
@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -24,10 +24,10 @@ jobs:
           pip install notion-client==2.2.1
           pip install requests
 
-      # ------------------------
-      # Phase 1 — Notion scan
-      # ------------------------
-      - name: Run Notion Scanner
+      # -------------------------------------------------------
+      # Phase 1 — Scan Notion & generate CSV
+      # -------------------------------------------------------
+      - name: Run Notion scanner (Phase 1)
         run: python notion_old_page_monitor.py
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -35,10 +35,10 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
 
-      # ------------------------
-      # Slack (Phase 2)
-      # ------------------------
-      - name: Send Slack message
+      # -------------------------------------------------------
+      # Phase 2 — Send Slack message (with legacy upload)
+      # -------------------------------------------------------
+      - name: Send Slack message with CSV (Phase 2)
         run: python notion_old_page_monitor.py --artifact-url dummy
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
