@@ -134,7 +134,7 @@ def get_database_pages(database_id):
 
     while True:
         resp = safe_request(
-            notion.datases.query,
+            notion.databases.query,  # ← исправлено здесь
             database_id=database_id,
             start_cursor=cursor
         )
