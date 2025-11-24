@@ -25,12 +25,13 @@ jobs:
           python-version: "3.11"
 
       # ===============================
-      # Install dependencies
+      # Install dependencies WITHOUT requirements.txt
       # ===============================
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install notion-client==2.2.1
+          pip install requests==2.31.0
 
       # ===============================
       # Restore cache (known pages)
@@ -46,4 +47,22 @@ jobs:
 
       # ===============================
       # Run Notion scanner
-      # =========================
+      # ===============================
+      - name: Run Notion tracker
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          mkdir -p notion_tracker_data
+          python notion_tracker_slack.py
+
+      # ===============================
+      # Save cache
+      # ===============================
+      - name: Save known pages cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: notion_tracker_data/known_pages.json
+          key: known-pages-cache
