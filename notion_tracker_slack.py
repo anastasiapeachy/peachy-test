@@ -1,10 +1,15 @@
 from notion_client import Client
+from notion_client.errors import APIResponseError
 import json
 import os
 import time
 import requests
 from datetime import datetime, timezone, timedelta
 
+
+# ==============================
+# ENVIRONMENT
+# ==============================
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
@@ -12,166 +17,248 @@ STORAGE_FILE = "notion_tracker_data/known_pages.json"
 
 notion = Client(auth=NOTION_TOKEN)
 
+WEEK_DELAY = timedelta(days=7)
+NOW = datetime.now(timezone.utc)
 
+
+# ==============================
+# SAFE REQUEST (retry)
+# ==============================
+def safe_request(func, *args, **kwargs):
+    retries = 7
+    delay = 0.25
+    backoff = 1
+
+    for attempt in range(retries):
+        try:
+            time.sleep(delay)
+            return func(*args, **kwargs)
+
+        except APIResponseError as e:
+            status = e.status
+
+            if status == 429:
+                retry_after = int(getattr(e, "headers", {}).get("Retry-After", 1))
+                print(f"[429] Rate limit → waiting {retry_after}s…")
+                time.sleep(retry_after)
+                continue
+
+            if 500 <= status <= 599:
+                print(f"[{status}] Server error → retry in {backoff}s…")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 20)
+                continue
+
+            raise
+
+    raise RuntimeError("Notion failed after multiple retries")
+
+
+# ==============================
+# HELPERS
+# ==============================
 def notion_url(page_id):
-    clean_id = page_id.replace("-", "")
-    return f"https://www.notion.so/{clean_id}"
+    return f"https://www.notion.so/{page_id.replace('-', '')}"
 
 
 def get_page_info(page_id):
-    page = notion.pages.retrieve(page_id=page_id)
-    
-    # Extract title
+    """Extract title, author, created_time, public_url."""
+    page = safe_request(notion.pages.retrieve, page_id=page_id)
+
+    # Title
     title = "Untitled"
-    if "properties" in page:
-        for prop in page["properties"].values():
-            if prop["type"] == "title" and prop.get("title"):
-                title = prop["title"][0]["plain_text"]
-                break
-    
-    # Get author name
-    author_info = page.get("created_by", {})
-    author_name = author_info.get("name", "Unknown")
-    
-    if not author_name or author_name == "Unknown":
+    for prop in page.get("properties", {}).values():
+        if prop["type"] == "title" and prop.get("title"):
+            title = prop["title"][0]["plain_text"]
+            break
+
+    # Author
+    author = "Unknown"
+    created_by = page.get("created_by", {})
+    if created_by:
         try:
-            user_data = notion.users.retrieve(user_id=author_info["id"])
-            author_name = user_data.get("name", "Unknown")
+            user_data = safe_request(notion.users.retrieve, user_id=created_by["id"])
+            author = user_data.get("name") or created_by.get("id")
         except Exception:
-            author_name = "Unknown"
-    
+            pass
+
+    # Timestamps
+    created_raw = page.get("created_time")
+    created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+
+    last_edited_raw = page.get("last_edited_time")
+    last_edited_dt = datetime.fromisoformat(last_edited_raw.replace("Z", "+00:00"))
+
+    # Is page public?
+    is_public = bool(page.get("public_url"))
+
     return {
         "id": page_id,
         "title": title,
-        "author": author_name,
+        "author": author,
         "url": notion_url(page_id),
-        "created_time": page.get("created_time", ""),
-        "is_public": bool(page.get("public_url"))
+        "created": created_dt,
+        "last_edited": last_edited_dt,
+        "is_public": is_public,
     }
 
 
-def get_all_pages(block_id):
-    pages = []
-    response = notion.blocks.children.list(block_id=block_id)
-    
+def get_block_children(block_id):
+    """Load all children with pagination."""
+    blocks = []
+    cursor = None
+
     while True:
-        for block in response["results"]:
-            if block["type"] == "child_page":
-                page_id = block["id"]
-                try:
-                    info = get_page_info(page_id)
-                    pages.append(info)
-                    # Recursively get subpages
-                    pages.extend(get_all_pages(page_id))
-                except Exception as e:
-                    print(f"Skipping page {page_id}: {e}")
-        
-        if not response.get("has_more"):
-            break
-        
-        response = notion.blocks.children.list(
-            block_id=block_id, 
-            start_cursor=response["next_cursor"]
+        resp = safe_request(
+            notion.blocks.children.list,
+            block_id=block_id,
+            start_cursor=cursor
         )
-        time.sleep(0.2)
-    
+        blocks.extend(resp.get("results", []))
+
+        cursor = resp.get("next_cursor")
+        if not cursor:
+            break
+
+        time.sleep(0.1)
+
+    return blocks
+
+
+def get_database_pages(database_id):
+    """Load all rows of a database."""
+    pages = []
+    cursor = None
+
+    while True:
+        resp = safe_request(
+            notion.databases.query,
+            database_id=database_id,
+            start_cursor=cursor
+        )
+        pages.extend(resp.get("results", []))
+
+        cursor = resp.get("next_cursor")
+        if not cursor:
+            break
+
+        time.sleep(0.1)
+
     return pages
 
 
+def is_empty_page(page_id):
+    """Page without blocks = empty (skip)."""
+    try:
+        blocks = get_block_children(page_id)
+        return len(blocks) == 0
+    except Exception:
+        return False
+
+
+# ==============================
+# FULL RECURSIVE SCANNER
+# (child_page, child_database, nested blocks)
+# ==============================
+def get_all_pages(block_id):
+    pages = []
+    children = get_block_children(block_id)
+
+    for block in children:
+        btype = block["type"]
+
+        # ---- child_page ----
+        if btype == "child_page":
+            pid = block["id"]
+            try:
+                info = get_page_info(pid)
+                pages.append(info)
+                pages.extend(get_all_pages(pid))
+            except Exception as e:
+                print(f"Skip page {pid}: {e}")
+
+        # ---- child_database ----
+        elif btype == "child_database":
+            db_id = block["id"]
+            try:
+                db_pages = get_database_pages(db_id)
+                for row in db_pages:
+                    pid = row["id"]
+
+                    if is_empty_page(pid):
+                        print(f"Skip empty DB row: {pid}")
+                        continue
+
+                    try:
+                        info = get_page_info(pid)
+                        pages.append(info)
+                        pages.extend(get_all_pages(pid))
+                    except Exception as e:
+                        print(f"Skip DB page {pid}: {e}")
+            except Exception as e:
+                print(f"Skip database {db_id}: {e}")
+
+        # ---- nested blocks with children ----
+        if block.get("has_children") and btype not in ("child_page", "child_database"):
+            try:
+                pages.extend(get_all_pages(block["id"]))
+            except Exception as e:
+                print(f"Skip nested block {block['id']}: {e}")
+
+    return pages
+
+
+# ==============================
+# CACHE MANAGEMENT
+# ==============================
 def load_known_pages():
     os.makedirs(os.path.dirname(STORAGE_FILE), exist_ok=True)
     if os.path.exists(STORAGE_FILE):
         with open(STORAGE_FILE, "r") as f:
-            data = json.load(f)
-        print(f"Loaded {len(data)} known pages")
-        return data
+            return json.load(f)
     return []
 
 
 def save_known_pages(pages):
     os.makedirs(os.path.dirname(STORAGE_FILE), exist_ok=True)
     with open(STORAGE_FILE, "w") as f:
-        json.dump(pages, f, indent=2, ensure_ascii=False)
-    print(f"Saved {len(pages)} pages")
+        json.dump(pages, f, indent=2, default=str)
 
 
-def send_to_slack(pages):
+# ==============================
+# SLACK
+# ==============================
+def send_to_slack(message):
     if not SLACK_WEBHOOK_URL:
-        print("No Slack webhook configured")
+        print("No Slack webhook found.")
         return
-    
-    blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"📚 *{len(pages)} new {'article' if len(pages) == 1 else 'articles'} published*"
-            }
-        },
-        {"type": "divider"}
-    ]
-    
-    for page in pages:
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*<{page['url']}|{page['title']}>*\n✍️ {page['author']}"
-            }
-        })
-    
-    payload = {"blocks": blocks}
-    
-    try:
-        response = requests.post(SLACK_WEBHOOK_URL, json=payload)
-        response.raise_for_status()
-        print(f"Posted {len(pages)} pages to Slack")
-    except Exception as e:
-        print(f"Failed to post to Slack: {e}")
+    requests.post(SLACK_WEBHOOK_URL, json={"text": message})
 
 
+# ==============================
+# MAIN LOGIC
+# ==============================
 def main():
-    print("Fetching pages from Notion...")
-    current_pages = get_all_pages(ROOT_PAGE_ID)
-    
-    known_pages = load_known_pages()
-    known_ids = {p["id"] for p in known_pages}
-    
-    # Find new pages
-    new_pages = [p for p in current_pages if p["id"] not in known_ids]
-    
-    if not new_pages:
-        print("No new pages found")
-        save_known_pages(current_pages)
-        return
-    
-    # Filter: public and older than 7 days
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=1)
+    print("Scanning Notion deeply…")
+    known = load_known_pages()
+    known_ids = {p["id"] for p in known}
+
+    all_pages = get_all_pages(ROOT_PAGE_ID)
+
+    # New pages (not in cache)
+    new_pages = [p for p in all_pages if p["id"] not in known_ids]
+
+    # Filter: only public AND older than 7 days
     eligible = []
-    
-    for page in new_pages:
-        if not page.get("created_time"):
-            continue
-        
-        try:
-            created = datetime.fromisoformat(page["created_time"].replace("Z", "+00:00"))
-            if page.get("is_public") and created < cutoff_date:
-                eligible.append(page)
-        except Exception:
-            continue
-    
+    for p in new_pages:
+        if p["is_public"] and p["created"] < (NOW - WEEK_DELAY):
+            eligible.append(p)
+
+    # Slack message
     if eligible:
-        print(f"Found {len(eligible)} pages to post")
-        send_to_slack(eligible)
-        # Add posted pages to known list
-        for page in eligible:
-            known_pages.append(page)
-    else:
-        print("No eligible pages (must be public and >1 days old)")
-    
-    # Only save pages we've actually posted
-    save_known_pages(known_pages)
-
-
-if __name__ == "__main__":
-    main()
+        lines = ["🆕 *New public Notion pages (older than 7 days):*\n"]
+        for p in eligible:
+            lines.append(
+                f":blue_book: *{p['title']}*\n"
+                f":link: {p['url']}\n"
+                f":writing_hand: {p['author']}_
