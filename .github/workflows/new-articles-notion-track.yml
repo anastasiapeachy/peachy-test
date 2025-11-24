@@ -1,44 +1,49 @@
-name: Notion Articles Tracker
+name: New Notion Articles Tracker
 
 on:
   schedule:
-    - cron: "0 9 * * *"
+    - cron: "0 9 * * *"   # каждый день в 09:00 UTC
   workflow_dispatch:
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    
+
     steps:
-      - uses: actions/checkout@v4
-      
-      - uses: actions/setup-python@v5
+      # ===============================
+      # Checkout repository
+      # ===============================
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ===============================
+      # Python setup
+      # ===============================
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      
+
+      # ===============================
+      # Install dependencies
+      # ===============================
       - name: Install dependencies
         run: |
-          pip install notion-client requests
-      
-      - name: Restore cache
-        uses: actions/cache@v4
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ===============================
+      # Restore cache (known pages)
+      # ===============================
+      - name: Restore known pages cache
+        id: cache-known
+        uses: actions/cache/restore@v4
         with:
           path: notion_tracker_data/known_pages.json
-          key: known-pages-${{ github.run_id }}
-          restore-keys: known-pages-
-      
-      - name: Run tracker
-        env:
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          mkdir -p notion_tracker_data
-          python notion_tracker_slack.py
-      
-      - name: Save cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: notion_tracker_data/known_pages.json
-          key: known-pages-${{ github.run_id }}
+          key: known-pages-cache
+          restore-keys: |
+            known-pages-
+
+      # ===============================
+      # Run Notion scanner
+      # =========================
