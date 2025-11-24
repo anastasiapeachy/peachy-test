@@ -1,9 +1,10 @@
 name: Notion Old Pages Report
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:   # 👉 можно запускать вручную в любое время
   schedule:
-    - cron: "0 9 1 */2 *"
+    # 👉 первый запуск 1 декабря, затем каждые два месяца (12,2,4,6,8,10)
+    - cron: "0 9 1 12,2,4,6,8,10 *"
 
 jobs:
   run-report:
@@ -24,7 +25,7 @@ jobs:
           pip install requests
 
       # -------------------------------------------------------
-      # 1 — Notion Scanner → CSV + count.json
+      # Phase 1 — сканирование Notion → CSV + count.json
       # -------------------------------------------------------
       - name: Run Notion Scanner
         run: python notion_old_page_monitor.py
@@ -34,7 +35,7 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
       # -------------------------------------------------------
-      # Upload CSV artifact
+      # Сохраняем CSV как artifact
       # -------------------------------------------------------
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
@@ -44,7 +45,7 @@ jobs:
           path: notion_old_pages.csv
 
       # -------------------------------------------------------
-      # Get artifact URL
+      # Получаем ссылку на artifact
       # -------------------------------------------------------
       - name: Get Artifact URL
         id: artifact_url
@@ -64,7 +65,7 @@ jobs:
             return `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/artifacts/${artifact.id}`;
 
       # -------------------------------------------------------
-      # 2 — Slack Notification
+      # Phase 2 — Slack notification
       # -------------------------------------------------------
       - name: Send Slack message
         run: python notion_old_page_monitor.py --artifact-url "${{ steps.artifact_url.outputs.result }}"
