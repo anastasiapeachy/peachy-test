@@ -11,13 +11,15 @@ with open("test.csv", "w", encoding="utf-8") as f:
 def test_upload_external():
     print("Step 1: Request upload URL")
 
-    # 1) получаем upload url
     r1 = requests.post(
         "https://slack.com/api/files.getUploadURLExternal",
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        headers={
+            "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+            "Content-Type": "application/json; charset=utf-8"
+        },
         json={
             "filename": "test.csv",
-            "length": os.path.getsize("test.csv"),
+            "length": os.path.getsize("test.csv")
         }
     )
 
@@ -30,21 +32,22 @@ def test_upload_external():
     upload_url = j["upload_url"]
     file_id = j["file_id"]
 
-    # 2) загружаем файл на выделенный URL
-    print("Step 2: PUT file")
+    print("Step 2: PUT upload...")
     with open("test.csv", "rb") as f:
         r2 = requests.put(upload_url, data=f)
-    print("PUT:", r2.status_code)
+    print("PUT:", r2.status_code, r2.text)
 
-    # 3) говорим Slack сохранить файл и прикрепить к каналу
     print("Step 3: Complete upload")
     r3 = requests.post(
         "https://slack.com/api/files.completeUploadExternal",
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        headers={
+            "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+            "Content-Type": "application/json; charset=utf-8"
+        },
         json={
             "files": [{"id": file_id}],
             "channel_id": SLACK_CHANNEL,
-            "initial_comment": "Test upload external"
+            "initial_comment": "External upload test OK"
         }
     )
 
