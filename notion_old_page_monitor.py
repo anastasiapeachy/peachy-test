@@ -266,6 +266,11 @@ def notify_slack():
         print("no CSV count file. Skip Slack.")
         return
 
+    # 🚫 New: Skip Slack if nothing found
+    if total == 0:
+        print("No old pages — Slack message skipped.")
+        return
+
     send_slack_webhook(total, ARTIFACT_URL)
 
 # ======================================================
