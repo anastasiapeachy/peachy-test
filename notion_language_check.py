@@ -252,15 +252,19 @@ def collect_all_pages(root_id: str):
             pages.extend(collect_all_pages(pid))
 
         # --- база данных ---
-        elif btype == "child_database":
-            dbid = block["id"]
+        elif t == "child_database":
+            db_id = block["id"]
             cursor = None
-
-        def query_db(dbid, cursor):
-            return notion.databases.query(database_id=dbid, start_cursor=cursor)
-
         while True:
-            resp = safe_request(query_db, dbid, cursor)
+        resp = safe_request(query_db, db_id, cursor)
+            for row in resp["results"]:
+            pid = row["id"]
+            if not is_empty_content(pid):
+                pages.append(pid)
+                pages.extend(collect_all_pages(pid))
+        cursor = resp.get("next_cursor")
+        if not cursor:
+            break
 
             for row in resp.get("results", []):
                 pid = row["id"]
