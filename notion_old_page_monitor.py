@@ -1,4 +1,5 @@
 from notion_client import Client
+from notion_client.errors import APIResponseError
 import os
 import time
 import requests
@@ -7,36 +8,72 @@ import csv
 import json
 import argparse
 
-# -------- Parse arguments (only for Slack phase) ----------
+# ======================================================
+# PHASE 2 argument: --artifact-url
+# ======================================================
 parser = argparse.ArgumentParser()
 parser.add_argument("--artifact-url", default=None)
 args = parser.parse_args()
-
 ARTIFACT_URL = args.artifact_url
 
-# -------- Environment -------------
+# ======================================================
+# ENVIRONMENT
+# ======================================================
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
 if not NOTION_TOKEN:
     raise ValueError("NOTION_TOKEN is not set")
+if not ROOT_PAGE_ID:
+    raise ValueError("ROOT_PAGE_ID is not set")
 
 notion = Client(auth=NOTION_TOKEN)
 ONE_YEAR_AGO = datetime.now(timezone.utc) - timedelta(days=365)
 
+# ======================================================
+# SAFE REQUEST (must appear BEFORE any function that uses it!)
+# ======================================================
+def safe_request(func, *args, **kwargs):
+    max_retries = 8
+    delay = 0.3
+    backoff = 1
 
-# -------- Helpers -------------
+    for attempt in range(max_retries):
+        try:
+            time.sleep(delay)
+            return func(*args, **kwargs)
+        except APIResponseError as e:
+            status = e.status
 
+            # Rate limit
+            if status == 429:
+                retry_after = int(getattr(e, "headers", {}).get("Retry-After", 1))
+                print(f"[429] Rate limit exceeded. Waiting {retry_after}s...")
+                time.sleep(retry_after)
+                continue
+
+            # Server errors
+            if 500 <= status <= 599:
+                print(f"[{status}] Server error. Retrying in {backoff}s...")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+                continue
+
+            raise
+
+    raise RuntimeError("Notion API not responding after retries")
+
+# ======================================================
+# HELPERS
+# ======================================================
 def notion_url(page_id):
     clean = page_id.replace("-", "")
     return f"https://www.notion.so/{clean}"
 
-
 def get_page_info(page_id):
-    page = notion.pages.retrieve(page_id=page_id)
+    page = safe_request(notion.pages.retrieve, page_id=page_id)
 
-    # Title
     title = "Untitled"
     if "properties" in page:
         for prop in page["properties"].values():
@@ -44,34 +81,18 @@ def get_page_info(page_id):
                 title = prop["title"][0]["plain_text"]
                 break
 
-    # Last edited
     last_raw = page.get("last_edited_time", "")
     last_dt = datetime.fromisoformat(last_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
-
-    # Detect empty database pages
-    props = page.get("properties", {})
-    db_props = [p for p in props.values() if p["type"] != "title"]
-    is_empty = all(
-        p.get(p["type"]) in (None, [], "", {}) or p.get("type") == "formula"
-        for p in props.values()
-    )
 
     return {
         "id": page_id,
         "title": title,
         "url": notion_url(page_id),
         "last_edited": last_dt,
-        "is_empty": is_empty
     }
 
-
-# -------- Deep recursive scanner (original working version) -------------
-
-# ======================================================
-# FULL RECURSIVE SCAN (OLD WORKING VERSION)
-# ======================================================
-def get_all_pages(block_id):
-    pages = []
+def get_block_children(block_id):
+    blocks = []
     cursor = None
 
     while True:
@@ -80,93 +101,117 @@ def get_all_pages(block_id):
             block_id=block_id,
             start_cursor=cursor
         )
-
-        for block in resp["results"]:
-            btype = block["type"]
-
-            # -------------------------
-            # child_page — обычная страница
-            # -------------------------
-            if btype == "child_page":
-                pid = block["id"]
-                try:
-                    info = get_page_info(pid)
-                    pages.append(info)
-                    pages.extend(get_all_pages(pid))
-                except Exception as e:
-                    print(f"Skip child_page {pid}: {e}")
-
-            # -------------------------
-            # Сильно вложенные блоки — старый рабочий обход
-            # -------------------------
-            # эти блоки МОГУТ содержать child_page внутри, даже если has_children=False
-            deep_blocks = [
-                "column", "column_list",
-                "bulleted_list_item", "numbered_list_item",
-                "toggle", "to_do", "synced_block",
-                "paragraph", "quote", "callout",
-                "heading_1", "heading_2", "heading_3"
-            ]
-
-            if btype in deep_blocks:
-                try:
-                    pages.extend(get_all_pages(block["id"]))
-                except Exception as e:
-                    print(f"Skip deep block {block['id']}: {e}")
-
-            # -------------------------
-            # nested children via has_children
-            # -------------------------
-            if block.get("has_children") and btype not in ("child_page",):
-                try:
-                    pages.extend(get_all_pages(block["id"]))
-                except Exception as e:
-                    print(f"Skip nested block {block['id']}: {e}")
-
+        blocks.extend(resp.get("results", []))
         cursor = resp.get("next_cursor")
         if not cursor:
             break
+        time.sleep(0.1)
 
-        time.sleep(0.15)
+    return blocks
+
+def get_database_pages(database_id):
+    pages = []
+    cursor = None
+
+    while True:
+        resp = safe_request(
+            notion.databases.query,
+            database_id=database_id,
+            start_cursor=cursor
+        )
+        pages.extend(resp.get("results", []))
+        cursor = resp.get("next_cursor")
+        if not cursor:
+            break
+        time.sleep(0.1)
 
     return pages
 
+def is_empty_page(page_id):
+    try:
+        children = get_block_children(page_id)
+        return len(children) == 0
+    except:
+        return False
 
-# -------- Slack message sender (webhook + button) -------------
+# ======================================================
+# FULL RECURSIVE SCAN
+# ======================================================
+def get_all_pages(block_id):
+    pages = []
+    children = get_block_children(block_id)
 
-def send_slack_message(total_count, csv_url):
+    for block in children:
+        btype = block["type"]
+
+        # child_page
+        if btype == "child_page":
+            pid = block["id"]
+            try:
+                info = get_page_info(pid)
+                pages.append(info)
+                pages.extend(get_all_pages(pid))
+            except Exception as e:
+                print(f"Skip child_page {pid}: {e}")
+
+        # child_database
+        elif btype == "child_database":
+            db_id = block["id"]
+            try:
+                db_pages = get_database_pages(db_id)
+                for db_page in db_pages:
+                    pid = db_page["id"]
+
+                    try:
+                        if is_empty_page(pid):
+                            print(f"Skip empty database page: {pid}")
+                            continue
+                    except Exception:
+                        pass
+
+                    try:
+                        info = get_page_info(pid)
+                        pages.append(info)
+                        pages.extend(get_all_pages(pid))
+                    except Exception as e:
+                        print(f"Skip db page {pid}: {e}")
+            except Exception as e:
+                print(f"Skip child_database {db_id}: {e}")
+
+        # deep nested blocks
+        if block.get("has_children") and btype not in ("child_page", "child_database"):
+            try:
+                pages.extend(get_all_pages(block["id"]))
+            except Exception as e:
+                print(f"Skip nested block {block['id']}: {e}")
+
+    return pages
+
+# ======================================================
+# SLACK WEBHOOK
+# ======================================================
+def send_slack_webhook(total, artifact_url):
     if not SLACK_WEBHOOK_URL:
-        print("SLACK_WEBHOOK_URL missing")
+        print("SLACK_WEBHOOK_URL missing, skipping Slack.")
         return
 
-    blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"📄 Найдено *{total_count}* страниц, которые не редактировались больше года."
-            }
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "⬇️ Download CSV"},
-                    "url": csv_url
-                }
-            ]
-        }
-    ]
+    text = (
+        f"📄 Found *{total}* pages in Notion that haven’t been edited for over a year.\n"
+        f"📎 CSV report: {artifact_url}"
+    )
 
-    payload = {"blocks": blocks}
+    try:
+        resp = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=10)
+        if resp.status_code != 200:
+            print(f"Slack error: {resp.status_code} {resp.text}")
+        else:
+            print("Slack message sent.")
+    except Exception as e:
+        print(f"Slack webhook error: {e}")
 
-    resp = requests.post(SLACK_WEBHOOK_URL, json=payload)
-    print("Slack response:", resp.status_code, resp.text)
-
-
-# -------- Phase 1: Generate CSV -----------
-
+# ======================================================
+# PHASE 1 — SCAN & CSV
+# ======================================================
 def generate_csv_and_count():
     print("Scanning Notion deeply...")
     pages = get_all_pages(ROOT_PAGE_ID)
@@ -176,43 +221,46 @@ def generate_csv_and_count():
         {
             "title": p["title"],
             "last_edited": p["last_edited"].isoformat(),
-            "url": p["url"]
+            "url": p["url"],
         }
         for p in pages
-        if not p["is_empty"] and p["last_edited"] < ONE_YEAR_AGO
+        if p["last_edited"] < ONE_YEAR_AGO
     ]
 
     old_pages.sort(key=lambda x: x["last_edited"])
     print(f"Old pages found: {len(old_pages)}")
 
-    # Save CSV
     with open("notion_old_pages.csv", "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["title", "last_edited", "url"])
         for p in old_pages:
             w.writerow([p["title"], p["last_edited"], p["url"]])
 
-    with open("notion_old_pages_count.json", "w") as f:
+    with open("notion_old_pages_count.json", "w", encoding="utf-8") as f:
         json.dump({"count": len(old_pages)}, f, ensure_ascii=False)
 
-    print("CSV saved")
+    print("CSV saved.")
 
-
-# -------- Phase 2: Slack -----------
-
+# ======================================================
+# PHASE 2 — SLACK
+# ======================================================
 def notify_slack():
-    with open("notion_old_pages_count.json", "r") as f:
-        total = json.load(f)["count"]
-
-    if total == 0:
-        print("No outdated pages — message not sent")
+    try:
+        with open("notion_old_pages_count.json", "r", encoding="utf-8") as f:
+            total = json.load(f)["count"]
+    except FileNotFoundError:
+        print("no CSV count file. Skip Slack.")
         return
 
-    send_slack_message(total, ARTIFACT_URL)
+    if total == 0:
+        print("No old pages — Slack message skipped.")
+        return
 
+    send_slack_webhook(total, ARTIFACT_URL)
 
-# -------- MAIN -----------
-
+# ======================================================
+# MAIN
+# ======================================================
 if ARTIFACT_URL:
     notify_slack()
 else:
