@@ -1,99 +1,162 @@
+"""
+REQUIREMENTS:
+pip install notion-client==2.2.1
+pip install requests
+"""
+
 from notion_client import Client
-import json
+from notion_client.errors import APIResponseError
 import os
 import time
+import json
 import requests
 from datetime import datetime, timezone, timedelta
 
-# === SETTINGS ===
+# ----------------------------------------------------
+# ENVIRONMENT
+# ----------------------------------------------------
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
-STORAGE_FILE = "notion_tracker_data/known_pages.json"
-DELAY_DAYS = 7   # задержка перед публикацией
+if not NOTION_TOKEN:
+    raise ValueError("NOTION_TOKEN is not set")
+if not ROOT_PAGE_ID:
+    raise ValueError("ROOT_PAGE_ID is not set")
 
+STORAGE_FILE = "notion_tracker_data/known_pages.json"
 notion = Client(auth=NOTION_TOKEN)
 
+WEEK_AGO = datetime.now(timezone.utc) - timedelta(days=7)
 
-def notion_url(page_id: str) -> str:
+
+# ----------------------------------------------------
+# SAFE REQUEST WRAPPER
+# ----------------------------------------------------
+def safe_request(func, *args, **kwargs):
+    retries = 7
+    delay = 0.25
+    backoff = 1
+
+    for attempt in range(retries):
+        try:
+            time.sleep(delay)
+            return func(*args, **kwargs)
+
+        except APIResponseError as e:
+            status = e.status
+
+            if status == 429:
+                retry_after = int(getattr(e, "headers", {}).get("Retry-After", 1))
+                print(f"[429] Rate limited → wait {retry_after}s…")
+                time.sleep(retry_after)
+                continue
+
+            if 500 <= status <= 599:
+                print(f"[{status}] Server error → retry in {backoff}s…")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 20)
+                continue
+
+            raise
+
+    raise RuntimeError("Notion failed after retries")
+
+
+# ----------------------------------------------------
+# HELPERS
+# ----------------------------------------------------
+def notion_url(page_id):
     clean = page_id.replace("-", "")
     return f"https://www.notion.so/{clean}"
 
 
 def get_page_info(page_id):
-    """Получает title, author, created_time, is_public."""
-    page = notion.pages.retrieve(page_id=page_id)
+    page = safe_request(notion.pages.retrieve, page_id=page_id)
 
-    # ------------------- TITLE -------------------
     title = "Untitled"
     for prop in page.get("properties", {}).values():
         if prop["type"] == "title" and prop.get("title"):
             title = prop["title"][0]["plain_text"]
             break
 
-    # ------------------- AUTHOR -------------------
-    author_info = page.get("created_by", {})
-    author_name = author_info.get("name") or author_info.get("id", "Unknown")
+    created_raw = page.get("created_time", "")
+    created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
 
-    if author_name == author_info.get("id"):
-        try:
-            u = notion.users.retrieve(user_id=author_info["id"])
-            author_name = u.get("name") or author_name
-        except:
-            pass
+    author = page.get("created_by", {}).get("name") or "Unknown"
 
-    # ------------------- TIMES -------------------
-    created_time = page.get("created_time", "")
-    last_edited = page.get("last_edited_time", "")
-
-    # ------------------- PUBLIC SHARE -------------------
+    # Check if page is publicly shared
     is_public = bool(page.get("public_url"))
 
     return {
         "id": page_id,
         "title": title,
-        "author": author_name,
         "url": notion_url(page_id),
-        "created_time": created_time,
-        "last_edited_time": last_edited,
-        "is_public": is_public,
+        "author": author,
+        "created_time": created_dt,
+        "is_public": is_public
     }
 
 
-def get_all_pages_recursively(block_id):
-    """Рекурсивно собирает child_page и вложенные."""
+# ----------------------------------------------------
+# FULL DEEP SCANNER (IDENTICAL TO YOUR OLD-PAGES VERSION)
+# ----------------------------------------------------
+def get_all_pages(block_id):
     pages = []
-    resp = notion.blocks.children.list(block_id=block_id)
+    cursor = None
 
     while True:
-        for block in resp.get("results", []):
-            if block["type"] == "child_page":
+        resp = safe_request(
+            notion.blocks.children.list,
+            block_id=block_id,
+            start_cursor=cursor
+        )
+
+        for block in resp["results"]:
+            btype = block["type"]
+
+            # child_page
+            if btype == "child_page":
                 pid = block["id"]
-                title = block["child_page"]["title"]
                 try:
                     info = get_page_info(pid)
+                    pages.append(info)
+                    pages.extend(get_all_pages(pid))
                 except Exception as e:
-                    print(f"⚠️ Error reading {title} ({pid}): {e}")
-                    continue
+                    print(f"Skip child_page {pid}: {e}")
 
-                pages.append(info)
-                # Рекурсивно идём внутрь
-                pages.extend(get_all_pages_recursively(pid))
+            # deep-scan any block with children
+            if block.get("has_children", False):
+                try:
+                    pages.extend(get_all_pages(block["id"]))
+                except Exception:
+                    pass
 
-        if not resp.get("has_more"):
+            # forced scanning inside major content blocks
+            if btype in [
+                "column", "column_list",
+                "bulleted_list_item", "numbered_list_item",
+                "toggle", "to_do", "synced_block",
+                "paragraph", "quote", "callout"
+            ]:
+                try:
+                    pages.extend(get_all_pages(block["id"]))
+                except Exception:
+                    pass
+
+        cursor = resp.get("next_cursor")
+        if not cursor:
             break
 
-        resp = notion.blocks.children.list(
-            block_id=block_id,
-            start_cursor=resp.get("next_cursor")
-        )
-        time.sleep(0.2)
+        time.sleep(0.15)
 
     return pages
 
 
-def load_known_pages():
+# ----------------------------------------------------
+# STORAGE
+# ----------------------------------------------------
+def load_known():
     os.makedirs(os.path.dirname(STORAGE_FILE), exist_ok=True)
     if os.path.exists(STORAGE_FILE):
         with open(STORAGE_FILE, "r") as f:
@@ -103,63 +166,54 @@ def load_known_pages():
     return []
 
 
-def save_known_pages(pages):
+def save_known(pages):
     os.makedirs(os.path.dirname(STORAGE_FILE), exist_ok=True)
     with open(STORAGE_FILE, "w") as f:
         json.dump(pages, f, indent=2, ensure_ascii=False)
     print(f"Saved {len(pages)} pages to cache")
 
 
+# ----------------------------------------------------
+# SLACK
+# ----------------------------------------------------
 def send_to_slack(message):
     if not SLACK_WEBHOOK_URL:
-        print("⚠️ SLACK_WEBHOOK_URL not set")
+        print("SLACK_WEBHOOK_URL is missing")
         return
     requests.post(SLACK_WEBHOOK_URL, json={"text": message})
 
 
+# ----------------------------------------------------
+# MAIN
+# ----------------------------------------------------
 def main():
-    known = load_known_pages()
+    known = load_known()
     known_ids = {p["id"] for p in known}
 
-    # === Сканируем весь раздел ===
-    current = get_all_pages_recursively(ROOT_PAGE_ID)
-    print(f"Found total pages BEFORE filtering: {len(current)}")  # <===== ✔️ ЛОГ
+    print("Deep scan of Notion…")
+    pages = get_all_pages(ROOT_PAGE_ID)
+    print(f"Found total pages BEFORE filtering: {len(pages)}")
 
-    # Новые страницы относительно кэша
-    new_pages = [p for p in current if p["id"] not in known_ids]
+    # NEW pages (not seen before)
+    new_pages = [p for p in pages if p["id"] not in known_ids]
 
-    # Фильтр — только public + старше 7 дней
-    now = datetime.now(timezone.utc)
-    eligible = []
+    # Filter: only public + older than 7 days
+    eligible = [
+        p for p in new_pages
+        if p["is_public"] and p["created_time"] < WEEK_AGO
+    ]
 
-    for p in new_pages:
-        if not p["is_public"]:
-            continue
-        if not p["created_time"]:
-            continue
-
-        try:
-            created_dt = datetime.fromisoformat(p["created_time"].replace("Z", "+00:00"))
-        except:
-            continue
-
-        if (now - created_dt).days >= DELAY_DAYS:
-            eligible.append(p)
-
-    # === Отправляем в Slack ===
     if eligible:
-        lines = ["🆕 *New public Notion articles (older than 7 days):*", ""]
+        message = "*🆕 New public articles older than 7 days:*\n\n"
         for p in eligible:
-            lines.append(
-                f":blue_book: *{p['title']}*\n"
-                f":link: {p['url']}\n"
-                f":writing_hand: {p['author']}\n"
-            )
-        send_to_slack("\n".join(lines))
+            message += f":blue_book: *{p['title']}*\n{p['url']}\n✍️ {p['author']}\n\n"
+
+        send_to_slack(message)
     else:
         print("No eligible pages to send.")
 
-    save_known_pages(current)
+    # Update the cache
+    save_known(pages)
 
 
 if __name__ == "__main__":
