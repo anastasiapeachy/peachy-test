@@ -3,15 +3,14 @@ name: Notion Old Pages Report
 on:
   workflow_dispatch:
   schedule:
-    # Запускается 1 декабря, 1 февраля, 1 апреля, 1 июня, 1 августа, 1 октября — в 09:00 UTC
-    - cron: "0 9 1 12,2,4,6,8,10 *"
+    - cron: "0 9 1 12,2,4,6,8,10 *"  # 1 декабря, затем каждые 2 месяца
 
 jobs:
   run-report:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -24,24 +23,42 @@ jobs:
           pip install notion-client==2.2.1
           pip install requests
 
-      # -------------------------------------------------------
-      # Phase 1 — Scan Notion & generate CSV
-      # -------------------------------------------------------
-      - name: Run Notion scanner (Phase 1)
+      # 🔥 Phase 1 — Always include SLACK_WEBHOOK_URL
+      - name: Run Notion Scanner
         run: python notion_old_page_monitor.py
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
-      # -------------------------------------------------------
-      # Phase 2 — Send Slack message (with legacy upload)
-      # -------------------------------------------------------
-      - name: Send Slack message with CSV (Phase 2)
-        run: python notion_old_page_monitor.py --artifact-url dummy
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        id: upload_csv
+        with:
+          name: notion-old-pages
+          path: notion_old_pages.csv
+
+      - name: Get Artifact URL
+        id: artifact_url
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId
+            });
+            const artifact = artifacts.data.artifacts.find(a => a.name === "notion-old-pages");
+            if (!artifact) {
+              core.setFailed("CSV artifact not found");
+            }
+            return `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/artifacts/${artifact.id}`;
+
+      # 🔥 Phase 2 — Always include SLACK_WEBHOOK_URL
+      - name: Send Slack message
+        run: python notion_old_page_monitor.py --artifact-url "${{ steps.artifact_url.outputs.result }}"
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
