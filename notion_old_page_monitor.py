@@ -67,44 +67,61 @@ def get_page_info(page_id):
 
 # -------- Deep recursive scanner (original working version) -------------
 
+# ======================================================
+# FULL RECURSIVE SCAN (OLD WORKING VERSION)
+# ======================================================
 def get_all_pages(block_id):
     pages = []
     cursor = None
 
     while True:
-        resp = notion.blocks.children.list(block_id=block_id, start_cursor=cursor)
+        resp = safe_request(
+            notion.blocks.children.list,
+            block_id=block_id,
+            start_cursor=cursor
+        )
 
         for block in resp["results"]:
             btype = block["type"]
 
-            # 1) Normal child pages
+            # -------------------------
+            # child_page — обычная страница
+            # -------------------------
             if btype == "child_page":
                 pid = block["id"]
                 try:
                     info = get_page_info(pid)
                     pages.append(info)
                     pages.extend(get_all_pages(pid))
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"Skip child_page {pid}: {e}")
 
-            # 2) Blocks with children → scan
-            if block.get("has_children", False):
-                try:
-                    pages.extend(get_all_pages(block["id"]))
-                except Exception:
-                    pass
-
-            # 3) Forced scanning inside content blocks
-            if btype in [
+            # -------------------------
+            # Сильно вложенные блоки — старый рабочий обход
+            # -------------------------
+            # эти блоки МОГУТ содержать child_page внутри, даже если has_children=False
+            deep_blocks = [
                 "column", "column_list",
                 "bulleted_list_item", "numbered_list_item",
                 "toggle", "to_do", "synced_block",
-                "paragraph", "quote", "callout"
-            ]:
+                "paragraph", "quote", "callout",
+                "heading_1", "heading_2", "heading_3"
+            ]
+
+            if btype in deep_blocks:
                 try:
                     pages.extend(get_all_pages(block["id"]))
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"Skip deep block {block['id']}: {e}")
+
+            # -------------------------
+            # nested children via has_children
+            # -------------------------
+            if block.get("has_children") and btype not in ("child_page",):
+                try:
+                    pages.extend(get_all_pages(block["id"]))
+                except Exception as e:
+                    print(f"Skip nested block {block['id']}: {e}")
 
         cursor = resp.get("next_cursor")
         if not cursor:
