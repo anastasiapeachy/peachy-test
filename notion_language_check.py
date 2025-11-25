@@ -24,6 +24,7 @@ API_DELAY = 0.3
 # глобальные кэши
 page_cache = {}
 user_cache = {}
+blocks_cache = {}
 
 # ===========================================================
 # SAFE NOTION CALL WRAPPER
@@ -48,7 +49,6 @@ def notion_call(func, **kwargs):
         except APIResponseError as e:
             if e.code == "rate_limited":
                 retry_after = None
-                # иногда Notion отдаёт заголовок Retry-After
                 try:
                     retry_after = e.response.headers.get("Retry-After")
                 except Exception:
@@ -57,14 +57,12 @@ def notion_call(func, **kwargs):
                 if retry_after:
                     wait = float(retry_after)
                 else:
-                    # экспоненциальная задержка: 2, 4, 8, 10, 10...
                     wait = min(2 ** (attempt + 1), 10)
 
                 print(f"[rate limit] waiting {wait}s (attempt {attempt+1}/{max_retries})...")
                 time.sleep(wait)
                 continue
 
-            # другие ошибки не трогаем
             raise
 
     raise Exception("Too many retries — still rate limited")
@@ -119,28 +117,49 @@ def get_user(uid):
 
 
 # ===========================================================
-# Fetch all pages in workspace
+# Fetch all pages under ROOT (instead of whole workspace)
 # ===========================================================
 
-def get_all_pages_in_workspace():
-    pages = []
-    cursor = None
+def get_all_pages_under_root(root_id):
+    """
+    Рекурсивно собираем ТОЛЬКО страницы-потомки ROOT_PAGE_ID.
+    Это заменяет get_all_pages_in_workspace() и is_child_of_root().
+    """
+    result = []
+    visited_blocks = set()
 
-    while True:
+    def walk(block_id):
+        if block_id in visited_blocks:
+            return
+        visited_blocks.add(block_id)
+
         resp = notion_call(
-            notion.search,
-            query="",
-            filter={"value": "page", "property": "object"},
-            start_cursor=cursor
+            notion.blocks.children.list,
+            block_id=block_id,
+            page_size=100
         )
 
-        pages.extend(resp.get("results", []))
+        for blk in resp.get("results", []):
+            btype = blk.get("type")
 
-        if not resp.get("has_more"):
-            break
-        cursor = resp.get("next_cursor")
+            if btype == "child_page":
+                page_id = normalize_id(blk["id"])
+                try:
+                    page = get_page(page_id)
+                    result.append(page)
+                except Exception:
+                    pass
 
-    return pages
+                walk(blk["id"])
+
+            if blk.get("has_children"):
+                walk(blk["id"])
+
+        if resp.get("has_more"):
+            walk(block_id)
+
+    walk(root_id)
+    return result
 
 
 # ===========================================================
@@ -155,7 +174,6 @@ def get_title(page):
             if parts:
                 return "".join(parts)
 
-    # fallback через блок child_page (на случай, если properties пустые)
     try:
         blk = notion_call(notion.blocks.retrieve, block_id=page["id"])
         if blk.get("type") == "child_page":
@@ -167,14 +185,13 @@ def get_title(page):
 
 
 # ===========================================================
-# Recursive blocks fetch (с page_size и без повторных запросов)
+# Recursive blocks fetch (cached)
 # ===========================================================
 
 def get_blocks_recursive(block_id):
-    """
-    Рекурсивно забираем ВСЕ блоки страницы (включая вложенные),
-    при этом каждый блок запрашиваем через children.list только один раз.
-    """
+    if block_id in blocks_cache:
+        return blocks_cache[block_id]
+
     blocks = []
     cursor = None
 
@@ -183,20 +200,23 @@ def get_blocks_recursive(block_id):
             notion.blocks.children.list,
             block_id=block_id,
             start_cursor=cursor,
-            page_size=100  # максимум за раз
+            page_size=100
         )
 
+        page_blocks = []
         for block in resp.get("results", []):
-            blocks.append(block)
+            page_blocks.append(block)
 
-            # если у блока есть дети — рекурсивно обрабатываем их
             if block.get("has_children"):
-                blocks.extend(get_blocks_recursive(block["id"]))
+                page_blocks.extend(get_blocks_recursive(block["id"]))
+
+        blocks.extend(page_blocks)
 
         if not resp.get("has_more"):
             break
         cursor = resp.get("next_cursor")
 
+    blocks_cache[block_id] = blocks
     return blocks
 
 
@@ -215,10 +235,6 @@ def extract_rich_text(rt_list):
 
 
 def block_own_text(block):
-    """
-    Берём ТОЛЬКО текст САМОГО блока, без детей.
-    Дети обрабатываются отдельно через get_blocks_recursive.
-    """
     texts = []
     btype = block.get("type")
     data = block.get(btype, {}) if btype else {}
@@ -230,98 +246,29 @@ def block_own_text(block):
         "numbered_list_item", "toggle", "to_do"
     ]
 
-    # обычные текстовые блоки
     if btype in rich_containers:
         rt = data.get("rich_text", [])
         texts.append(extract_rich_text(rt))
 
-    # code
     if btype == "code":
         rt = data.get("rich_text", [])
         texts.append(extract_rich_text(rt))
 
-    # caption (image, file, video, etc.)
     if isinstance(data, dict) and "caption" in data:
         cap = data.get("caption", [])
         texts.append(extract_rich_text(cap))
 
-    # equation
     if btype == "equation":
         expr = data.get("expression")
         if expr:
             texts.append(expr)
 
-    # table_row — берём текст из ячеек
     if btype == "table_row":
         cells = data.get("cells", [])
         for cell in cells:
             texts.append(extract_rich_text(cell))
 
-    # column / column_list / synced_block — сами по себе текста не несут
-
     return " ".join(t for t in texts if t).strip()
-
-
-# ===========================================================
-# Parent resolution
-# ===========================================================
-
-def resolve_block_parent_to_page(block_id):
-    visited = set()
-    while True:
-        if block_id in visited:
-            return None
-        visited.add(block_id)
-        try:
-            blk = notion_call(notion.blocks.retrieve, block_id=block_id)
-        except Exception:
-            return None
-        parent = blk.get("parent", {}) or {}
-        ptype = parent.get("type")
-        if ptype == "page_id":
-            return normalize_id(parent.get("page_id"))
-        if ptype == "block_id":
-            block_id = parent.get("block_id")
-            continue
-        return None
-
-
-def is_child_of_root(page, root_id, page_index):
-    visited = set()
-    current = page
-    while True:
-        parent = current.get("parent", {}) or {}
-        ptype = parent.get("type")
-
-        if ptype == "page_id":
-            pid = normalize_id(parent.get("page_id"))
-            if pid == root_id:
-                return True
-            if pid in visited:
-                return False
-            visited.add(pid)
-            try:
-                current = page_index.get(pid) or get_page(pid)
-            except Exception:
-                return False
-            continue
-
-        elif ptype == "block_id":
-            bid = parent.get("block_id")
-            resolved = resolve_block_parent_to_page(bid)
-            if resolved == root_id:
-                return True
-            if not resolved or resolved in visited:
-                return False
-            visited.add(resolved)
-            try:
-                current = page_index.get(resolved) or get_page(resolved)
-            except Exception:
-                return False
-            continue
-
-        else:
-            return False
 
 
 # ===========================================================
@@ -350,11 +297,10 @@ def analyze_page(page_id):
     blocks = get_blocks_recursive(page_id)
 
     if not blocks:
-        return ru, en, True, False  # ничего не прочитали
+        return ru, en, True, False
 
     has_content = False
     for block in blocks:
-        # не лезем в child_page (другие статьи)
         if block.get("type") == "child_page":
             continue
 
@@ -376,7 +322,7 @@ def analyze_page(page_id):
 
 
 # ===========================================================
-# MAIN WITH BATCHING
+# MAIN
 # ===========================================================
 
 def main():
@@ -384,26 +330,11 @@ def main():
     unreadable_pages = []
     title_only_pages = []
 
-    print("Fetching ALL pages in workspace (once)...")
-    all_pages = get_all_pages_in_workspace()
-    print(f"Total pages in workspace: {len(all_pages)}")
-
-    page_index = {normalize_id(p["id"]): p for p in all_pages}
-
-    # выбираем только root и его потомков
-    selected = []
-    for p in all_pages:
-        pid = normalize_id(p["id"])
-        if pid == ROOT_PAGE_ID:
-            selected.append(p)
-            continue
-        try:
-            if is_child_of_root(p, ROOT_PAGE_ID, page_index):
-                selected.append(p)
-        except Exception as e:
-            print(f"Skip page {pid} in is_child_of_root: {e}")
-
+    print("Fetching pages under ROOT_PAGE_ID…")
+    selected = get_all_pages_under_root(ROOT_PAGE_ID)
     print(f"Total pages under root: {len(selected)}")
+
+    page_index = {normalize_id(p["id"]): p for p in selected}
 
     batch_size = 20
     batches = [selected[i:i + batch_size] for i in range(0, len(selected), batch_size)]
@@ -417,12 +348,8 @@ def main():
         for p in batch:
             pid = normalize_id(p["id"])
 
-            # нормальный объект страницы (через индекс или кэш)
             try:
                 page = page_index.get(pid) or get_page(pid)
-            except APIResponseError as e:
-                print(f"Skip page {pid}: {e}")
-                continue
             except Exception as e:
                 print(f"Skip page {pid}: {e}")
                 continue
@@ -430,7 +357,6 @@ def main():
             title = get_title(page)
             url = make_url(pid)
 
-            # автор
             author_info = page.get("created_by", {}) or {}
             author = author_info.get("name")
             if not author:
@@ -441,10 +367,8 @@ def main():
             if not author:
                 author = "(unknown)"
 
-            # анализ текста
             ru, en, unreadable, has_content = analyze_page(pid)
 
-            # Пропускаем страницы только с заголовком (без контента)
             if not has_content:
                 print(f"⊘ Skipping title-only page: {title} — {url}")
                 title_only_pages.append((title, url))
@@ -466,10 +390,8 @@ def main():
                 "% English": round(en_pct, 2),
             })
 
-        # пауза между батчами, чтобы Notion отдохнул
         time.sleep(1.0)
 
-    # сортировка: по английскому, потом по русскому
     if results:
         results.sort(
             key=lambda x: (x["% English"], x["% Russian"]),
@@ -487,7 +409,7 @@ def main():
     print(f"\nSaved {len(results)} rows → {fname}")
 
     if title_only_pages:
-        print(f"\n⊘ Skipped {len(title_only_pages)} title-only pages (not included in CSV)")
+        print(f"\n⊘ Skipped {len(title_only_pages)} title-only pages")
 
     if unreadable_pages:
         print("\n⚠ Pages that API could NOT read:")
