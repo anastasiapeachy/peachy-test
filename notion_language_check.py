@@ -18,29 +18,56 @@ if not NOTION_TOKEN or not ROOT_PAGE_ID:
 
 notion = Client(auth=NOTION_TOKEN)
 
-API_DELAY = 0.2       # пауза после каждого запроса
-MAX_RETRIES = 3       # число попыток при rate limit
+# базовая задержка после каждого успешного запроса
+API_DELAY = 0.3
 
+# глобальные кэши
+page_cache = {}
+user_cache = {}
 
 # ===========================================================
 # SAFE NOTION CALL WRAPPER
 # ===========================================================
 
 def notion_call(func, **kwargs):
-    """Обёртка над Notion API c обработкой rate limits."""
-    for attempt in range(MAX_RETRIES):
+    """
+    Безопасный вызов Notion API с обработкой rate limits:
+    - учитывает Retry-After, если есть
+    - использует экспоненциальную паузу
+    - после каждого удачного запроса делает небольшую задержку
+    """
+    base_delay = API_DELAY
+    max_retries = 7
+
+    for attempt in range(max_retries):
         try:
             res = func(**kwargs)
-            time.sleep(API_DELAY)
+            time.sleep(base_delay)
             return res
+
         except APIResponseError as e:
-            # Код для rate limit
-            if e.code == "rate_limited" and attempt < MAX_RETRIES - 1:
-                wait = (attempt + 1) * 2
-                print(f"[rate_limit] Sleeping {wait}s and retrying...")
+            if e.code == "rate_limited":
+                retry_after = None
+                # иногда Notion отдаёт заголовок Retry-After
+                try:
+                    retry_after = e.response.headers.get("Retry-After")
+                except Exception:
+                    retry_after = None
+
+                if retry_after:
+                    wait = float(retry_after)
+                else:
+                    # экспоненциальная задержка: 2, 4, 8, 10, 10...
+                    wait = min(2 ** (attempt + 1), 10)
+
+                print(f"[rate limit] waiting {wait}s (attempt {attempt+1}/{max_retries})...")
                 time.sleep(wait)
                 continue
+
+            # другие ошибки не трогаем
             raise
+
+    raise Exception("Too many retries — still rate limited")
 
 
 # ===========================================================
@@ -63,6 +90,32 @@ ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
 def make_url(page_id):
     clean = page_id.replace("-", "")
     return f"https://www.notion.so/{clean}"
+
+
+def get_page(pid):
+    """Получаем страницу из кэша или через Notion API."""
+    pid_norm = normalize_id(pid)
+    if pid_norm not in page_cache:
+        page_cache[pid_norm] = notion_call(
+            notion.pages.retrieve,
+            page_id=pid_norm
+        )
+    return page_cache[pid_norm]
+
+
+def get_user(uid):
+    """Получаем пользователя из кэша или через Notion API."""
+    if not uid:
+        return None
+    if uid not in user_cache:
+        try:
+            user_cache[uid] = notion_call(
+                notion.users.retrieve,
+                user_id=uid
+            )
+        except Exception:
+            user_cache[uid] = None
+    return user_cache[uid]
 
 
 # ===========================================================
@@ -114,12 +167,12 @@ def get_title(page):
 
 
 # ===========================================================
-# Recursive blocks fetch (без повторных запросов в extractor)
+# Recursive blocks fetch (с page_size и без повторных запросов)
 # ===========================================================
 
 def get_blocks_recursive(block_id):
     """
-    Рекурсивно забираем ВСЕ блоки страницы (включая вложенные, колонки, таблицы и т.д.),
+    Рекурсивно забираем ВСЕ блоки страницы (включая вложенные),
     при этом каждый блок запрашиваем через children.list только один раз.
     """
     blocks = []
@@ -129,7 +182,8 @@ def get_blocks_recursive(block_id):
         resp = notion_call(
             notion.blocks.children.list,
             block_id=block_id,
-            start_cursor=cursor
+            start_cursor=cursor,
+            page_size=100  # максимум за раз
         )
 
         for block in resp.get("results", []):
@@ -147,11 +201,10 @@ def get_blocks_recursive(block_id):
 
 
 # ===========================================================
-# Text extraction per block (как в рабочем дебаге — поменьше, но точнее)
+# Text extraction per block
 # ===========================================================
 
 def extract_rich_text(rt_list):
-    """Аналог того, что мы использовали в дебаге: аккуратно собираем plain_text."""
     pieces = []
     for rt in rt_list:
         if not isinstance(rt, dict):
@@ -163,9 +216,8 @@ def extract_rich_text(rt_list):
 
 def block_own_text(block):
     """
-    ВАЖНО: берем ТОЛЬКО текст САМОГО блока, без детей.
+    Берём ТОЛЬКО текст САМОГО блока, без детей.
     Дети обрабатываются отдельно через get_blocks_recursive.
-    Это повторяет логику «успешного дебага», где считали по блокам.
     """
     texts = []
     btype = block.get("type")
@@ -205,9 +257,7 @@ def block_own_text(block):
         for cell in cells:
             texts.append(extract_rich_text(cell))
 
-    # synced_block: само тело обычно в детях, тут ничего отдельно не считаем
-
-    # column / column_list — сами по себе текста не несут, только дети → тут пусто
+    # column / column_list / synced_block — сами по себе текста не несут
 
     return " ".join(t for t in texts if t).strip()
 
@@ -251,10 +301,7 @@ def is_child_of_root(page, root_id, page_index):
                 return False
             visited.add(pid)
             try:
-                current = page_index.get(pid) or notion_call(
-                    notion.pages.retrieve,
-                    page_id=pid
-                )
+                current = page_index.get(pid) or get_page(pid)
             except Exception:
                 return False
             continue
@@ -268,10 +315,7 @@ def is_child_of_root(page, root_id, page_index):
                 return False
             visited.add(resolved)
             try:
-                current = page_index.get(resolved) or notion_call(
-                    notion.pages.retrieve,
-                    page_id=resolved
-                )
+                current = page_index.get(resolved) or get_page(resolved)
             except Exception:
                 return False
             continue
@@ -296,18 +340,17 @@ def count_words(text):
 
 
 # ===========================================================
-# Analyze page (логика как в удачном дебаге, только обобщённая)
+# Analyze page
 # ===========================================================
 
 def analyze_page(page_id):
     ru = 0
     en = 0
 
-    # берём ВСЕ блоки страницы, включая вложенные, колонки и т.п.
     blocks = get_blocks_recursive(page_id)
 
     if not blocks:
-        return ru, en, True  # ничего не прочитали
+        return ru, en, True, False  # ничего не прочитали
 
     has_content = False
     for block in blocks:
@@ -347,7 +390,7 @@ def main():
 
     page_index = {normalize_id(p["id"]): p for p in all_pages}
 
-    # выбираем только root и его потомков (включая страницы в колонках и т.п.)
+    # выбираем только root и его потомков
     selected = []
     for p in all_pages:
         pid = normalize_id(p["id"])
@@ -374,14 +417,10 @@ def main():
         for p in batch:
             pid = normalize_id(p["id"])
 
-            # пробуем достать нормальный объект страницы
+            # нормальный объект страницы (через индекс или кэш)
             try:
-                page = page_index.get(pid) or notion_call(
-                    notion.pages.retrieve,
-                    page_id=pid
-                )
+                page = page_index.get(pid) or get_page(pid)
             except APIResponseError as e:
-                # страница недоступна интеграции
                 print(f"Skip page {pid}: {e}")
                 continue
             except Exception as e:
@@ -396,12 +435,9 @@ def main():
             author = author_info.get("name")
             if not author:
                 uid = author_info.get("id")
-                if uid:
-                    try:
-                        user = notion_call(notion.users.retrieve, user_id=uid)
-                        author = user.get("name")
-                    except Exception:
-                        author = None
+                user = get_user(uid)
+                if user:
+                    author = user.get("name")
             if not author:
                 author = "(unknown)"
 
@@ -430,7 +466,7 @@ def main():
                 "% English": round(en_pct, 2),
             })
 
-        # небольшая пауза между батчами, чтобы Notion отдохнул
+        # пауза между батчами, чтобы Notion отдохнул
         time.sleep(1.0)
 
     # сортировка: по английскому, потом по русскому
