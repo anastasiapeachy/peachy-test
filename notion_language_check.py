@@ -239,12 +239,6 @@ def is_empty_page(page_id: str) -> bool:
 # =====================================
 
 def collect_all_pages(root_id: str):
-    """
-    Рекурсивно обходим всё дерево под ROOT_PAGE_ID:
-    - child_page
-    - child_database (и их страницы)
-    - nested blocks с has_children (колонки, toggles и т.п.)
-    """
     pages = []
     children = get_children(root_id)
 
@@ -261,26 +255,22 @@ def collect_all_pages(root_id: str):
         elif btype == "child_database":
             dbid = block["id"]
             cursor = None
-            while True:
-                resp = safe_request(
-                    notion.databases.query,
-                    database_id=dbid,
-                    start_cursor=cursor
-                )
-                for row in resp.get("results", []):
-                    pid = normalize_id(row["id"])
 
-                    # пропускаем пустые страницы базы (только title, без контента)
-                    if is_empty_page(pid):
-                        print(f"Skip empty database page: {pid}")
-                        continue
+        def query_db(dbid, cursor):
+            return notion.databases.query(database_id=dbid, start_cursor=cursor)
 
+        while True:
+            resp = safe_request(query_db, dbid, cursor)
+
+            for row in resp.get("results", []):
+                pid = row["id"]
+                if not is_empty_content(pid):
                     pages.append(pid)
                     pages.extend(collect_all_pages(pid))
 
-                cursor = resp.get("next_cursor")
-                if not cursor:
-                    break
+            cursor = resp.get("next_cursor")
+            if not cursor:
+                break
 
         # --- вложенные блоки (колонки, toggles, synced и т.п.) ---
         if block.get("has_children") and btype not in ("child_page", "child_database"):
