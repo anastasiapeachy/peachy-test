@@ -1,70 +1,202 @@
-name: Notion Old Pages Report
+from notion_client import Client
+import os
+import time
+import requests
+from datetime import datetime, timezone, timedelta
+import csv
+import json
+import argparse
 
-on:
-  workflow_dispatch:
-  schedule:
-    # 1 число чётных месяцев (фев, апр, июн, авг, окт, дек) в 09:00 UTC
-    - cron: "0 9 1 2,4,6,8,10,12 *"
+# -------- Parse arguments (only for Slack phase) ----------
+parser = argparse.ArgumentParser()
+parser.add_argument("--artifact-url", default=None)
+args = parser.parse_args()
 
-jobs:
-  run-report:
-    runs-on: ubuntu-latest
+ARTIFACT_URL = args.artifact_url
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+# -------- Environment -------------
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+if not NOTION_TOKEN:
+    raise ValueError("NOTION_TOKEN is not set")
 
-      - name: Install dependencies
-        run: |
-          pip install notion-client==2.2.1
-          pip install requests
+notion = Client(auth=NOTION_TOKEN)
+ONE_YEAR_AGO = datetime.now(timezone.utc) - timedelta(days=365)
 
-      # -----------------------------
-      # Phase 1 — Notion → CSV
-      # -----------------------------
-      - name: Run Notion Scanner
-        run: python notion_old_page_monitor.py
-        env:
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
 
-      - name: Read old pages count
-        id: old_count
-        run: |
-          python - << 'PY'
-          import json
-          with open("notion_old_pages_count.json", "r", encoding="utf-8") as f:
-              data = json.load(f)
-          print(f"count={data['count']}")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
-              out.write(f"count={data['count']}\n")
-          PY
+# -------- Helpers -------------
 
-      # -----------------------------
-      # Create / update GitHub Release with CSV
-      # -----------------------------
-      - name: Create or update GitHub Release
-        if: steps.old_count.outputs.count != '0'
-        id: create_release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: notion-old-pages
-          name: Notion Old Pages Report
-          make_latest: true
-          files: notion_old_pages.csv
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+def notion_url(page_id):
+    clean = page_id.replace("-", "")
+    return f"https://www.notion.so/{clean}"
 
-      # -----------------------------
-      # Phase 2 — Slack notification
-      # -----------------------------
-      - name: Send Slack message with Download button
-        if: steps.old_count.outputs.count != '0'
-        run: python notion_old_page_monitor.py --artifact-url "${{ steps.create_release.outputs.html_url }}"
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+def get_page_info(page_id):
+    page = notion.pages.retrieve(page_id=page_id)
+
+    # Title
+    title = "Untitled"
+    if "properties" in page:
+        for prop in page["properties"].values():
+            if prop["type"] == "title" and prop.get("title"):
+                title = prop["title"][0]["plain_text"]
+                break
+
+    # Last edited
+    last_raw = page.get("last_edited_time", "")
+    last_dt = datetime.fromisoformat(last_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+    # Detect empty database pages
+    props = page.get("properties", {})
+    db_props = [p for p in props.values() if p["type"] != "title"]
+    is_empty = all(
+        p.get(p["type"]) in (None, [], "", {}) or p.get("type") == "formula"
+        for p in props.values()
+    )
+
+    return {
+        "id": page_id,
+        "title": title,
+        "url": notion_url(page_id),
+        "last_edited": last_dt,
+        "is_empty": is_empty
+    }
+
+
+# -------- Deep recursive scanner (original working version) -------------
+
+def get_all_pages(block_id):
+    pages = []
+    cursor = None
+
+    while True:
+        resp = notion.blocks.children.list(block_id=block_id, start_cursor=cursor)
+
+        for block in resp["results"]:
+            btype = block["type"]
+
+            # 1) Normal child pages
+            if btype == "child_page":
+                pid = block["id"]
+                try:
+                    info = get_page_info(pid)
+                    pages.append(info)
+                    pages.extend(get_all_pages(pid))
+                except Exception:
+                    pass
+
+            # 2) Blocks with children → scan
+            if block.get("has_children", False):
+                try:
+                    pages.extend(get_all_pages(block["id"]))
+                except Exception:
+                    pass
+
+            # 3) Forced scanning inside content blocks
+            if btype in [
+                "column", "column_list",
+                "bulleted_list_item", "numbered_list_item",
+                "toggle", "to_do", "synced_block",
+                "paragraph", "quote", "callout"
+            ]:
+                try:
+                    pages.extend(get_all_pages(block["id"]))
+                except Exception:
+                    pass
+
+        cursor = resp.get("next_cursor")
+        if not cursor:
+            break
+
+        time.sleep(0.15)
+
+    return pages
+
+
+# -------- Slack message sender (webhook + button) -------------
+
+def send_slack_message(total_count, csv_url):
+    if not SLACK_WEBHOOK_URL:
+        print("SLACK_WEBHOOK_URL missing")
+        return
+
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"📄 Найдено *{total_count}* страниц, которые не редактировались больше года."
+            }
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "⬇️ Download CSV"},
+                    "url": csv_url
+                }
+            ]
+        }
+    ]
+
+    payload = {"blocks": blocks}
+
+    resp = requests.post(SLACK_WEBHOOK_URL, json=payload)
+    print("Slack response:", resp.status_code, resp.text)
+
+
+# -------- Phase 1: Generate CSV -----------
+
+def generate_csv_and_count():
+    print("Scanning Notion deeply...")
+    pages = get_all_pages(ROOT_PAGE_ID)
+    print(f"Total discovered pages: {len(pages)}")
+
+    old_pages = [
+        {
+            "title": p["title"],
+            "last_edited": p["last_edited"].isoformat(),
+            "url": p["url"]
+        }
+        for p in pages
+        if not p["is_empty"] and p["last_edited"] < ONE_YEAR_AGO
+    ]
+
+    old_pages.sort(key=lambda x: x["last_edited"])
+    print(f"Old pages found: {len(old_pages)}")
+
+    # Save CSV
+    with open("notion_old_pages.csv", "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["title", "last_edited", "url"])
+        for p in old_pages:
+            w.writerow([p["title"], p["last_edited"], p["url"]])
+
+    with open("notion_old_pages_count.json", "w") as f:
+        json.dump({"count": len(old_pages)}, f, ensure_ascii=False)
+
+    print("CSV saved")
+
+
+# -------- Phase 2: Slack -----------
+
+def notify_slack():
+    with open("notion_old_pages_count.json", "r") as f:
+        total = json.load(f)["count"]
+
+    if total == 0:
+        print("No outdated pages — message not sent")
+        return
+
+    send_slack_message(total, ARTIFACT_URL)
+
+
+# -------- MAIN -----------
+
+if ARTIFACT_URL:
+    notify_slack()
+else:
+    generate_csv_and_count()
