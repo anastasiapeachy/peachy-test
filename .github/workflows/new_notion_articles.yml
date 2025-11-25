@@ -1,0 +1,49 @@
+name: New Notion Articles Tracker
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * *"  # every day at 09:00 UTC
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install notion-client==2.2.1
+          pip install requests
+
+      - name: Restore known pages cache
+        id: cache-known
+        uses: actions/cache@v4
+        with:
+          path: notion_tracker_data/known_pages.json
+          key: known-pages-cache
+          restore-keys: |
+            known-pages-
+
+      - name: Run New Notion Articles Tracker
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          mkdir -p notion_tracker_data
+          python notion_new_articles.py
+
+      - name: Save known pages cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: notion_tracker_data/known_pages.json
+          key: known-pages-cache
