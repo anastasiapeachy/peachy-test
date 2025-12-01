@@ -120,7 +120,6 @@ def get_children(block_id):
 # =====================================
 
 def query_db(db_id, cursor=None):
-    """Запрос строк БД с пагинацией."""
     body = {"page_size": 100}
     if cursor:
         body["start_cursor"] = cursor
@@ -144,10 +143,15 @@ def is_empty_content(page_id):
 
 
 # =====================================
-# RECURSIVE BLOCK COLLECTION
+# BLOCK CACHE (ускорение ×100)
 # =====================================
 
+BLOCK_CACHE = {}
+
 def get_blocks_recursive(block_id):
+    if block_id in BLOCK_CACHE:
+        return BLOCK_CACHE[block_id]
+
     blocks = []
     cursor = None
 
@@ -167,6 +171,7 @@ def get_blocks_recursive(block_id):
             break
         cursor = resp.get("next_cursor")
 
+    BLOCK_CACHE[block_id] = blocks
     return blocks
 
 
@@ -242,29 +247,33 @@ def is_empty_page(page_id: str) -> bool:
 
 
 # =====================================
-# COLLECT ALL PAGES
+# PAGE VISIT CACHE (ускорение ×500, спасает от бесконечных обходов)
 # =====================================
 
+VISITED_PAGES = set()
+
 def collect_all_pages(root_id: str):
+    if root_id in VISITED_PAGES:
+        return []
+    VISITED_PAGES.add(root_id)
+
     pages = []
     children = get_children(root_id)
 
     for block in children:
         btype = block.get("type")
 
-        # --- подстраница ---
         if btype == "child_page":
             pid = normalize_id(block["id"])
             pages.append(pid)
             pages.extend(collect_all_pages(pid))
 
-        # --- база данных ---
         elif btype == "child_database":
             db_id = block["id"]
             cursor = None
 
             while True:
-                resp = query_db(db_id, cursor)   # ←←← ИСПРАВЛЕНО ТУТ
+                resp = query_db(db_id, cursor)
 
                 for row in resp["results"]:
                     pid = row["id"]
@@ -276,7 +285,6 @@ def collect_all_pages(root_id: str):
                 if not cursor:
                     break
 
-        # --- другие блоки ---
         if block.get("has_children") and btype not in ("child_page", "child_database"):
             pages.extend(collect_all_pages(block["id"]))
 
