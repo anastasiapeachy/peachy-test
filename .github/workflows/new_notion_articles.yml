@@ -1,12 +1,12 @@
-name: New Notion Articles
+name: New Articles Tracker
 
 on:
   schedule:
-    - cron: "0 9 * * *"   # every day 09:00 UTC
+    - cron: "0 9 * * *"
   workflow_dispatch:
 
 jobs:
-  scan:
+  tracker:
     runs-on: ubuntu-latest
 
     steps:
@@ -20,27 +20,26 @@ jobs:
 
       - name: Install deps
         run: |
-          pip install notion-client==2.2.1
-          pip install requests
+          pip install notion-client==2.2.1 requests
 
       - name: Restore cache
         uses: actions/cache@v4
         with:
           path: notion_tracker_data/known_pages.json
-          key: pages-cache
+          key: known-pages-cache
 
-      - name: Run scanner
+      - name: Run tracker
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           mkdir -p notion_tracker_data
-          python new_notion_articles.py
+          python new_articles_tracker.py
 
       - name: Save cache
-        if: always()
         uses: actions/cache/save@v4
+        if: always()
         with:
           path: notion_tracker_data/known_pages.json
-          key: pages-cache
+          key: known-pages-cache
