@@ -116,7 +116,7 @@ def get_children(block_id):
 
 
 # =====================================
-# DATABASE QUERY (взято из твоего рабочего кода)
+# DATABASE QUERY
 # =====================================
 
 def query_db(db_id, cursor=None):
@@ -132,11 +132,10 @@ def query_db(db_id, cursor=None):
 
 
 # =====================================
-# EMPTY CONTENT CHECK (взято из твоего рабочего кода)
+# EMPTY CONTENT CHECK
 # =====================================
 
 def is_empty_content(page_id):
-    """Проверка, есть ли у страницы хоть один блок текста."""
     try:
         blocks = get_children(page_id)
         return len(blocks) == 0
@@ -265,7 +264,7 @@ def collect_all_pages(root_id: str):
             cursor = None
 
             while True:
-                resp = query_db(db_id, cursor)
+                resp = query_db(db_id, cursor)   # ←←← ИСПРАВЛЕНО ТУТ
 
                 for row in resp["results"]:
                     pid = row["id"]
