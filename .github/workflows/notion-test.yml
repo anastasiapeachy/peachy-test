@@ -1,4 +1,4 @@
-name: Test New Notion Pages (24h)
+name: Notion New Pages TEST
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -16,14 +16,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           pip install notion-client==2.2.1
           pip install requests
 
-      - name: Run test scanner
+      - name: Run test scanner (last 24h)
+        run: python notion_new_pages_test.py
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: python notion_new_pages_test.py
