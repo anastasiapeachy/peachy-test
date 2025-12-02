@@ -12,7 +12,9 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
 notion = Client(auth=NOTION_TOKEN)
 
-# === Safe request: retry on 429 and 5xx ===
+# =====================================================
+# Safe request with retry (твоя рабочая версия)
+# =====================================================
 def safe_request(func, *args, **kwargs):
     retries = 7
     delay = 0.25
@@ -42,12 +44,12 @@ def safe_request(func, *args, **kwargs):
 
     raise RuntimeError("Notion not responding")
 
-
-# === Helpers ===
+# =====================================================
+# Helpers
+# =====================================================
 def notion_url(page_id):
     clean = page_id.replace("-", "")
     return f"https://www.notion.so/{clean}"
-
 
 def get_page_info(page_id):
     page = safe_request(notion.pages.retrieve, page_id=page_id)
@@ -58,7 +60,6 @@ def get_page_info(page_id):
             title = prop["title"][0]["plain_text"]
             break
 
-    # created_time
     created_raw = page.get("created_time", "")
     created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
 
@@ -69,8 +70,9 @@ def get_page_info(page_id):
         "url": notion_url(page_id),
     }
 
-
-# === Deep recursive page scanner ===
+# =====================================================
+# Deep recursive page scanner (твоя рабочая версия)
+# =====================================================
 def get_block_children(block_id):
     blocks = []
     cursor = None
@@ -85,11 +87,9 @@ def get_block_children(block_id):
         cursor = resp.get("next_cursor")
         if not cursor:
             break
-
         time.sleep(0.1)
 
     return blocks
-
 
 def get_all_pages(block_id):
     pages = []
@@ -107,7 +107,7 @@ def get_all_pages(block_id):
             except Exception as e:
                 print(f"Skip child_page {pid}: {e}")
 
-        # deep nested blocks
+        # nested blocks
         if block.get("has_children", False):
             try:
                 pages.extend(get_all_pages(block["id"]))
@@ -116,8 +116,9 @@ def get_all_pages(block_id):
 
     return pages
 
-
-# === Slack ===
+# =====================================================
+# Slack
+# =====================================================
 def send_slack(text):
     if not SLACK_WEBHOOK_URL:
         print("Slack webhook missing")
@@ -126,10 +127,11 @@ def send_slack(text):
     resp = requests.post(SLACK_WEBHOOK_URL, json={"text": text})
     print("Slack:", resp.status_code, resp.text)
 
-
-# === MAIN (TEST MODE) ===
+# =====================================================
+# MAIN (TESTING MODE)
+# =====================================================
 def main():
-    print("Scanning all pages deeply…")
+    print("🔍 Deep scan of Notion…")
     pages = get_all_pages(ROOT_PAGE_ID)
     print(f"Total pages found: {len(pages)}")
 
@@ -140,7 +142,7 @@ def main():
         if p["created"] > one_day_ago
     ]
 
-    print(f"Pages created in last 24 hours: {len(new_pages)}")
+    print(f"Pages created in last 24h: {len(new_pages)}")
 
     if not new_pages:
         send_slack("❗ Тест: нет новых страниц за последние 24 часа.")
