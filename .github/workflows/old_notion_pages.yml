@@ -18,11 +18,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: 'pip'  # Cache pip dependencies for faster runs
+          cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          pip install notion-client==2.2.1 requests
+        run: pip install -r requirements.txt
 
       - name: Scan Notion workspace and generate report
         run: python notion_old_page_monitor.py
