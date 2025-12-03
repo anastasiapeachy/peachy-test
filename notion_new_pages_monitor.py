@@ -22,6 +22,10 @@ notion = Client(auth=NOTION_TOKEN)
 # за последние 24 часа
 ONE_DAY_AGO = datetime.now(timezone.utc) - timedelta(days=1)
 
+# Timeout protection (5 hours max)
+MAX_EXECUTION_TIME = 5 * 60 * 60  # 5 hours in seconds
+START_TIME = time.time()
+
 # ------------------------
 # SAFE REQUEST (retry)
 # ------------------------
@@ -54,6 +58,13 @@ def safe_request(func, *args, **kwargs):
     raise RuntimeError("Notion is not responding after retries")
 
 # ------------------------
+# TIMEOUT CHECK
+# ------------------------
+def check_timeout():
+    if time.time() - START_TIME > MAX_EXECUTION_TIME:
+        raise RuntimeError("⏱️ Execution timeout exceeded (5 hours)")
+
+# ------------------------
 # HELPERS
 # ------------------------
 def notion_url(page_id):
@@ -62,6 +73,8 @@ def notion_url(page_id):
 
 def get_page_info(page_id):
     """Extracts title, url, author, created."""
+    check_timeout()
+    
     page = safe_request(notion.pages.retrieve, page_id=page_id)
 
     # Title
@@ -99,6 +112,8 @@ def get_page_info(page_id):
 # BLOCK CHILDREN
 # ------------------------
 def get_block_children(block_id):
+    check_timeout()
+    
     blocks = []
     cursor = None
 
@@ -120,50 +135,84 @@ def get_block_children(block_id):
     return blocks
 
 # ------------------------
-# FULL SCAN (this one works properly!)
+# FULL SCAN WITH VISITED TRACKING
 # ------------------------
-def get_all_pages(block_id):
+def get_all_pages(block_id, visited=None, depth=0):
+    """
+    Recursively scan pages with cycle detection.
+    visited: set of already-processed page/block IDs
+    depth: recursion depth (for debugging)
+    """
+    if visited is None:
+        visited = set()
+    
+    # Prevent cycles
+    if block_id in visited:
+        return []
+    
+    visited.add(block_id)
+    check_timeout()
+    
+    # Safety: limit recursion depth
+    if depth > 50:
+        print(f"⚠️ Max depth (50) reached at block {block_id}")
+        return []
+    
     pages = []
-    children = get_block_children(block_id)
+    
+    try:
+        children = get_block_children(block_id)
+    except Exception as e:
+        print(f"❌ Failed to get children of {block_id}: {e}")
+        return []
 
     for block in children:
+        check_timeout()
+        
         btype = block["type"]
+        bid = block["id"]
+
+        # Skip if already visited
+        if bid in visited:
+            continue
 
         # 1️⃣ Child page
         if btype == "child_page":
-            pid = block["id"]
             try:
-                info = get_page_info(pid)
+                info = get_page_info(bid)
                 pages.append(info)
-                pages.extend(get_all_pages(pid))
+                # Recursively scan this page's children
+                pages.extend(get_all_pages(bid, visited, depth + 1))
             except Exception as e:
-                print(f"Skip child_page {pid}: {e}")
+                print(f"Skip child_page {bid}: {e}")
 
         # 2️⃣ Child database
         elif btype == "child_database":
-            db_id = block["id"]
-
             try:
-                db_pages = safe_request(notion.databases.query, database_id=db_id)
+                db_pages = safe_request(notion.databases.query, database_id=bid)
                 for db_page in db_pages["results"]:
                     pid = db_page["id"]
+                    
+                    if pid in visited:
+                        continue
 
                     try:
                         info = get_page_info(pid)
                         pages.append(info)
-                        pages.extend(get_all_pages(pid))
+                        pages.extend(get_all_pages(pid, visited, depth + 1))
                     except Exception as e:
                         print(f"Skip db row {pid}: {e}")
 
             except Exception as e:
-                print(f"Skip database {db_id}: {e}")
+                print(f"Skip database {bid}: {e}")
 
-        # 3️⃣ Columns, toggles, nested blocks
-        if block.get("has_children", False):
+        # 3️⃣ Nested blocks (columns, toggles, etc.) - ONLY if not a page/database
+        elif btype not in ["child_page", "child_database"] and block.get("has_children", False):
             try:
-                pages.extend(get_all_pages(block["id"]))
-            except:
-                pass
+                # Don't add to pages list, just recurse to find nested pages
+                pages.extend(get_all_pages(bid, visited, depth + 1))
+            except Exception as e:
+                print(f"Skip nested block {bid}: {e}")
 
     return pages
 
@@ -182,26 +231,33 @@ def send_slack(text):
 # MAIN
 # ------------------------
 def main():
-    print("Scanning Notion deeply…")
-    pages = get_all_pages(ROOT_PAGE_ID)
-    print(f"Total discovered pages: {len(pages)}")
+    try:
+        print("Scanning Notion deeply…")
+        pages = get_all_pages(ROOT_PAGE_ID)
+        print(f"Total discovered pages: {len(pages)}")
 
-    new_pages = [p for p in pages if p["created"] > ONE_DAY_AGO]
-    print(f"Pages created in last 24h: {len(new_pages)}")
+        new_pages = [p for p in pages if p["created"] > ONE_DAY_AGO]
+        print(f"Pages created in last 24h: {len(new_pages)}")
 
-    if not new_pages:
-        send_slack("❗ Тест: новых страниц за последние 24 часа не найдено.")
-        return
+        if not new_pages:
+            send_slack("❗ Тест: новых страниц за последние 24 часа не найдено.")
+            return
 
-    msg = ["🆕 *Тест: новые страницы (созданы за последние 24 часа):*", ""]
-    for p in new_pages:
-        msg.append(
-            f"📘 *{p['title']}*\n"
-            f"🔗 {p['url']}\n"
-            f"✍️ {p['author']}\n"
-        )
+        msg = ["🆕 *Тест: новые страницы (созданы за последние 24 часа):*", ""]
+        for p in new_pages:
+            msg.append(
+                f"📘 *{p['title']}*\n"
+                f"🔗 {p['url']}\n"
+                f"✍️ {p['author']}\n"
+            )
 
-    send_slack("\n".join(msg))
+        send_slack("\n".join(msg))
+        
+    except RuntimeError as e:
+        error_msg = f"❌ Script error: {str(e)}"
+        print(error_msg)
+        send_slack(error_msg)
+        raise
 
 if __name__ == "__main__":
     main()
