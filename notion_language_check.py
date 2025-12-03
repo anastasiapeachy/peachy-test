@@ -32,28 +32,27 @@ def safe_request(func, *args, **kwargs):
     for attempt in range(max_retries):
         try:
             res = func(*args, **kwargs)
-            time.sleep(0.2)
+            time.sleep(0.15)
             return res
 
         except APIResponseError as e:
             status = getattr(e, "status", None)
             code = getattr(e, "code", None)
 
-            # Rate limit
             if status == 429 or code == "rate_limited":
                 retry_after = getattr(e, "headers", {}).get("Retry-After")
                 if retry_after:
                     try:
                         wait = int(retry_after)
-                    except Exception:
+                    except:
                         wait = 2
                 else:
                     wait = (attempt + 1) * 2
+
                 print(f"[rate limit] waiting {wait}s…")
                 time.sleep(wait)
                 continue
 
-            # 5xx server error
             if status and 500 <= status <= 599:
                 print(f"[{status}] server error, retrying…")
                 time.sleep(delay)
@@ -69,7 +68,6 @@ def safe_request(func, *args, **kwargs):
 
     raise RuntimeError("Notion API not responding after retries")
 
-
 # =====================================
 # HELPERS
 # =====================================
@@ -84,30 +82,27 @@ def normalize_id(raw_id: str) -> str:
 ROOT_PAGE_ID = normalize_id(ROOT_PAGE_ID)
 
 def make_url(page_id: str) -> str:
-    clean = page_id.replace("-", "")
-    return f"https://www.notion.so/{clean}"
+    return f"https://www.notion.so/{page_id.replace('-', '')}"
 
 def get_page(page_id):
     return safe_request(notion.pages.retrieve, page_id=page_id)
 
-def get_page_title(page) -> str:
-    props = page.get("properties", {}) or {}
+def get_page_title(page):
+    props = page.get("properties", {})
     for prop in props.values():
         if prop.get("type") == "title":
-            parts = [t.get("plain_text", "") for t in prop.get("title", [])]
-            if parts:
-                return "".join(parts)
+            return "".join([t.get("plain_text", "") for t in prop.get("title", [])])
     return "(untitled)"
+
+def get_page_title_as_text(page):
+    """Fallback: treat title as body text if page has no blocks."""
+    return get_page_title(page).strip()
 
 def get_children(block_id):
     blocks = []
     cursor = None
     while True:
-        resp = safe_request(
-            notion.blocks.children.list,
-            block_id=block_id,
-            start_cursor=cursor
-        )
+        resp = safe_request(notion.blocks.children.list, block_id=block_id, start_cursor=cursor)
         blocks.extend(resp.get("results", []))
         cursor = resp.get("next_cursor")
         if not cursor:
@@ -123,10 +118,7 @@ def query_db(db_id, cursor=None):
     if cursor:
         body["start_cursor"] = cursor
 
-    return safe_request(
-        notion.databases.query,
-        **{"database_id": db_id, **body}
-    )
+    return safe_request(notion.databases.query, **{"database_id": db_id, **body})
 
 # =====================================
 # BLOCK CACHE
@@ -155,58 +147,82 @@ def get_blocks_recursive(block_id):
 
         if not resp.get("has_more"):
             break
+
         cursor = resp.get("next_cursor")
 
     BLOCK_CACHE[block_id] = blocks
     return blocks
 
 # =====================================
-# TEXT EXTRACTION FIXED
+# TEXT EXTRACTION — FIXED & FULL
 # =====================================
 
 def extract_rich_text(rt_list):
-    pieces = []
+    parts = []
     for rt in rt_list:
         if isinstance(rt, dict):
             txt = rt.get("plain_text")
             if txt:
-                pieces.append(txt)
-    return " ".join(pieces)
+                parts.append(txt)
+    return " ".join(parts)
 
-def block_own_text(block) -> str:
-    """Extract text from any text-containing block type."""
+def extract_text_fallback(block):
+    """Full fallback extractor for Notion weird cases."""
+
     btype = block.get("type")
     data = block.get(btype, {}) if btype else {}
 
-    # main text source
+    # most common — paragraphs
     if "rich_text" in data:
-        return extract_rich_text(data.get("rich_text", []))
+        txt = extract_rich_text(data["rich_text"])
+        if txt.strip():
+            return txt
 
-    # captions
+    # caption fallback
     if "caption" in data:
-        return extract_rich_text(data.get("caption", []))
+        txt = extract_rich_text(data["caption"])
+        if txt.strip():
+            return txt
 
-    # table cells
+    # table rows
     if btype == "table_row":
-        parts = []
+        texts = []
         for cell in data.get("cells", []):
-            parts.append(extract_rich_text(cell))
-        return " ".join(parts)
+            texts.append(extract_rich_text(cell))
+        combined = " ".join(texts).strip()
+        if combined:
+            return combined
+
+    # final fallback: blocks sometimes contain "text" or "plain_text"
+    if isinstance(data, dict):
+        for key in data.keys():
+            if isinstance(data[key], str) and data[key].strip():
+                return data[key]
 
     return ""
 
+def block_own_text(block):
+    """Unified text extractor with fallback."""
+    text = extract_text_fallback(block)
+    return text.strip()
+
 # =====================================
-# PAGE TEXT PRESENCE CHECK
+# CHECK IF PAGE HAS REAL TEXT
 # =====================================
 
-def page_has_real_text(page_id: str) -> bool:
-    """Return True only if page contains real readable text."""
+def page_has_real_text(page_id):
+    """Return True if page contains real human text."""
     blocks = get_blocks_recursive(page_id)
+
     for block in blocks:
-        text = block_own_text(block).strip()
-        if text:
+        txt = block_own_text(block)
+        if txt.strip():
             return True
-    return False
+
+    # fallback to title-as-body
+    page = get_page(page_id)
+    title_txt = get_page_title_as_text(page)
+    return bool(title_txt.strip())
 
 # =====================================
 # PAGE VISIT CACHE
@@ -214,7 +230,7 @@ def page_has_real_text(page_id: str) -> bool:
 
 VISITED_PAGES = set()
 
-def collect_all_pages(root_id: str):
+def collect_all_pages(root_id):
     if root_id in VISITED_PAGES:
         return []
     VISITED_PAGES.add(root_id)
@@ -257,35 +273,38 @@ def collect_all_pages(root_id: str):
 def detect_lang(text: str) -> str:
     try:
         return detect(text)
-    except Exception:
+    except:
         return "unknown"
 
 def count_words(text: str) -> int:
     return len(re.findall(r"\b\w+\b", text))
 
-def analyze_page_language(page_id: str):
+def analyze_page_language(page_id):
     ru = 0
     en = 0
 
     blocks = get_blocks_recursive(page_id)
-    if not blocks:
-        return ru, en, True
 
     for block in blocks:
-        text = block_own_text(block).strip()
-        if not text:
+        text = block_own_text(block)
+        if not text.strip():
+            continue
+
+        words = count_words(text)
+        if words == 0:
             continue
 
         lang = detect_lang(text)
-        words = count_words(text)
 
         if lang == "ru":
             ru += words
         elif lang == "en":
             en += words
 
-    unreadable = (ru + en == 0)
-    return ru, en, unreadable
+    if ru + en == 0:
+        return 0, 0, True
+
+    return ru, en, False
 
 # =====================================
 # MAIN
@@ -293,39 +312,27 @@ def analyze_page_language(page_id: str):
 
 def main():
     start = time.time()
-    print("Collecting all pages under ROOT_PAGE_ID…")
+    print("Collecting pages...")
 
-    page_ids = collect_all_pages(ROOT_PAGE_ID)
-    page_ids = list(dict.fromkeys(page_ids))
-
-    print(f"Total pages discovered: {len(page_ids)}")
+    page_ids = list(dict.fromkeys(collect_all_pages(ROOT_PAGE_ID)))
+    print(f"Total pages: {len(page_ids)}")
 
     results = []
-    unreadable_pages = []
+    unreadable = []
 
     for pid in page_ids:
-
-        # 1) Skip pages fully empty
         if not page_has_real_text(pid):
             continue
 
-        try:
-            page = get_page(pid)
-        except Exception as e:
-            print(f"Skip page {pid}: {e}")
-            continue
-
+        page = get_page(pid)
         title = get_page_title(page)
         url = make_url(pid)
+        author = page.get("created_by", {}).get("name", "(unknown)")
 
-        # author
-        author_info = page.get("created_by", {}) or {}
-        author = author_info.get("name", "(unknown)")
+        ru, en, unread = analyze_page_language(pid)
 
-        ru, en, unreadable = analyze_page_language(pid)
-
-        if unreadable:
-            unreadable_pages.append((title, url))
+        if unread:
+            unreadable.append((title, url))
 
         total = ru + en
         ru_pct = ru * 100 / total if total else 0
@@ -336,32 +343,19 @@ def main():
             "Page URL": url,
             "Author": author,
             "% Russian": round(ru_pct, 2),
-            "% English": round(en_pct, 2),
+            "% English": round(en_pct, 2)
         })
 
-    # sort
     results.sort(key=lambda x: (x["% English"], x["% Russian"]), reverse=True)
 
-    # csv
-    fname = "notion_language_percentages.csv"
-    with open(fname, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["Page Title", "Page URL", "Author", "% Russian", "% English"]
-        )
+    with open("notion_language_percentages.csv", "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["Page Title", "Page URL", "Author", "% Russian", "% English"])
         writer.writeheader()
-        for row in results:
-            writer.writerow(row)
+        writer.writerows(results)
 
-    print(f"\nSaved {len(results)} rows → {fname}")
+    print(f"Saved {len(results)} results → notion_language_percentages.csv")
 
-    if unreadable_pages:
-        print("\nUnreadable pages:")
-        for t, u in unreadable_pages:
-            print(f"- {t}: {u}")
-
-    print(f"\nDone in {time.time() - start:.1f}s")
-
+    print(f"Done in {time.time() - start:.1f}s")
 
 if __name__ == "__main__":
     main()
