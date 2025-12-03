@@ -1,0 +1,5 @@
+# Notion API client
+notion-client==2.2.1
+
+# HTTP requests for Slack webhook
+requests==2.31.0
