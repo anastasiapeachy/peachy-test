@@ -103,27 +103,21 @@ def get_page_title(page: dict) -> str:
 
 def get_page_author(page: dict) -> str:
     """Extract author from page with fallback to user API."""
-    author_info = page.get("created_by", {})
-    if not author_info:
-        return "Unknown"
+    created_by = page.get("created_by", {}) or {}
+    author = created_by.get("name")
     
-    # Try to get name directly
-    author = author_info.get("name")
-    if author:
-        return author
+    if not author:
+        uid = created_by.get("id")
+        if uid:
+            try:
+                user = notion.users.retrieve(user_id=uid)
+                time.sleep(0.1)  # Rate limiting
+                author = user.get("name")
+            except Exception as e:
+                print(f"  ⚠ Could not fetch user {uid}: {e}")
+                author = None
     
-    # Fallback: fetch user by ID
-    user_id = author_info.get("id")
-    if user_id:
-        try:
-            user_data = safe_request(notion.users.retrieve, user_id=user_id)
-            author = user_data.get("name")
-            if author:
-                return author
-        except Exception as e:
-            print(f"  ⚠ Could not fetch user {user_id}: {e}")
-    
-    return "Unknown"
+    return author if author else "Unknown"
 
 
 def get_children(block_id: str, page_size: int = 100) -> List[dict]:
