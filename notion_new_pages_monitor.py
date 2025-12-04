@@ -63,7 +63,7 @@ def safe_request(func, *args, **kwargs):
 # ------------------------
 def check_timeout():
     if time.time() - START_TIME > MAX_EXECUTION_TIME:
-        raise RuntimeError("⏱️ Execution timeout exceeded (5 hours)")
+        raise RuntimeError("Execution timeout exceeded (5 hours)")
 
 # ------------------------
 # HELPERS
@@ -156,7 +156,7 @@ def get_all_pages(block_id, visited=None, depth=0):
     
     # Safety: limit recursion depth
     if depth > 50:
-        print(f"⚠️ Max depth (50) reached at block {block_id}")
+        print(f"Max depth (50) reached at block {block_id}")
         return []
     
     pages = []
@@ -164,7 +164,7 @@ def get_all_pages(block_id, visited=None, depth=0):
     try:
         children = get_block_children(block_id)
     except Exception as e:
-        print(f"❌ Failed to get children of {block_id}: {e}")
+        print(f"Failed to get children of {block_id}: {e}")
         return []
 
     for block in children:
@@ -245,10 +245,10 @@ def main():
         print(f"Pages created 7-21 days ago: {len(filtered_pages)}")
 
         if not filtered_pages:
-            send_slack("❗ No pages found created between 7 and 21 days ago.")
+            print("No pages found created between 7 and 21 days ago.")
             return
 
-        msg = ["🆕 *Pages created 7-21 days ago (biweekly report):*", ""]
+        msg = ["🆕 *New pages created in Notion:*", ""]
         for p in filtered_pages:
             msg.append(
                 f"📘 *{p['title']}*\n"
@@ -259,9 +259,9 @@ def main():
         send_slack("\n".join(msg))
         
     except RuntimeError as e:
-        error_msg = f"❌ Script error: {str(e)}"
+        error_msg = f"Script error: {str(e)}"
         print(error_msg)
-        send_slack(error_msg)
+        send_slack(f"❌ {error_msg}")
         raise
 
 if __name__ == "__main__":
