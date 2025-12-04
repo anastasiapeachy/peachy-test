@@ -19,8 +19,9 @@ if not ROOT_PAGE_ID:
 
 notion = Client(auth=NOTION_TOKEN)
 
-# за последние 24 часа
-ONE_DAY_AGO = datetime.now(timezone.utc) - timedelta(days=1)
+# Time range: 7 to 21 days ago
+SEVEN_DAYS_AGO = datetime.now(timezone.utc) - timedelta(days=7)
+TWENTY_ONE_DAYS_AGO = datetime.now(timezone.utc) - timedelta(days=21)
 
 # Timeout protection (5 hours max)
 MAX_EXECUTION_TIME = 5 * 60 * 60  # 5 hours in seconds
@@ -236,15 +237,19 @@ def main():
         pages = get_all_pages(ROOT_PAGE_ID)
         print(f"Total discovered pages: {len(pages)}")
 
-        new_pages = [p for p in pages if p["created"] > ONE_DAY_AGO]
-        print(f"Pages created in last 24h: {len(new_pages)}")
+        # Filter pages created between 7 and 21 days ago
+        filtered_pages = [
+            p for p in pages 
+            if TWENTY_ONE_DAYS_AGO <= p["created"] <= SEVEN_DAYS_AGO
+        ]
+        print(f"Pages created 7-21 days ago: {len(filtered_pages)}")
 
-        if not new_pages:
-            send_slack("❗ Тест: новых страниц за последние 24 часа не найдено.")
+        if not filtered_pages:
+            send_slack("❗ No pages found created between 7 and 21 days ago.")
             return
 
-        msg = ["🆕 *Тест: новые страницы (созданы за последние 24 часа):*", ""]
-        for p in new_pages:
+        msg = ["🆕 *Pages created 7-21 days ago (biweekly report):*", ""]
+        for p in filtered_pages:
             msg.append(
                 f"📘 *{p['title']}*\n"
                 f"🔗 {p['url']}\n"
