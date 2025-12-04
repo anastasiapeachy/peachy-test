@@ -1,10 +1,10 @@
-name: Notion New Pages Test
+name: Notion Biweekly Pages Report
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 9 * * *"   # каждый день в 9 UTC
+    - cron: "0 9 */14 * *"   # Every 14 days at 9 UTC
 jobs:
-  run-test:
+  run-biweekly-report:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -15,7 +15,7 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Run test scanner
+      - name: Run biweekly scanner
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
