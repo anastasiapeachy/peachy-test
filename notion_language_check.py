@@ -163,6 +163,14 @@ def get_blocks_recursive(block_id: str, max_depth: int = 10, current_depth: int 
 
     BLOCK_CACHE[block_id] = blocks
     return blocks
+    """Extract plain text from Notion rich text objects."""
+    parts = []
+    for rt in rich_text_list:
+        if isinstance(rt, dict):
+            text = rt.get("plain_text", "")
+            if text:
+                parts.append(text)
+    return " ".join(parts)
 
 
 def extract_rich_text(rich_text_list: List[dict]) -> str:
@@ -206,8 +214,8 @@ def extract_block_text(block: dict) -> str:
     return ""
 
 
-def collect_all_pages(root_id: str, max_pages: int = MAX_PAGES) -> List[str]:
-    """Recursively collect all page IDs in workspace with safety limit."""
+def collect_all_pages(root_id: str) -> List[str]:
+    """Recursively collect all page IDs in workspace."""
     root_id = normalize_id(root_id)
     
     if root_id in VISITED_PAGES:
@@ -223,38 +231,31 @@ def collect_all_pages(root_id: str, max_pages: int = MAX_PAGES) -> List[str]:
         return pages
 
     for block in children:
-        if len(VISITED_PAGES) >= max_pages:
-            print(f"⚠ Reached maximum page limit ({max_pages})")
-            return pages
-            
         block_type = block.get("type")
 
         try:
             if block_type == "child_page":
                 page_id = normalize_id(block["id"])
                 pages.append(page_id)
-                pages.extend(collect_all_pages(page_id, max_pages))
+                pages.extend(collect_all_pages(page_id))
 
             elif block_type == "child_database":
                 db_id = block["id"]
                 cursor = None
 
                 while True:
-                    if len(VISITED_PAGES) >= max_pages:
-                        break
-                        
                     response = query_database(db_id, cursor)
                     for row in response["results"]:
                         page_id = row["id"]
                         pages.append(page_id)
-                        pages.extend(collect_all_pages(page_id, max_pages))
+                        pages.extend(collect_all_pages(page_id))
 
                     cursor = response.get("next_cursor")
                     if not cursor:
                         break
 
             elif block.get("has_children") and block_type not in ("child_page", "child_database"):
-                pages.extend(collect_all_pages(block["id"], max_pages))
+                pages.extend(collect_all_pages(block["id"]))
                 
         except Exception as e:
             print(f"⚠ Error processing block {block.get('id', 'unknown')}: {e}")
@@ -326,12 +327,11 @@ def main():
     print("🔍 Notion Language Analysis")
     print("=" * 70)
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Max pages: {MAX_PAGES}")
     print()
 
     print("📥 Collecting pages from workspace...")
     root_normalized = normalize_id(ROOT_PAGE_ID)
-    page_ids = list(dict.fromkeys(collect_all_pages(root_normalized, MAX_PAGES)))
+    page_ids = list(dict.fromkeys(collect_all_pages(root_normalized)))
     print(f"✅ Found {len(page_ids)} pages to analyze\n")
 
     print("🔬 Analyzing language distribution...")
