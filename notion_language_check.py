@@ -101,6 +101,31 @@ def get_page_title(page: dict) -> str:
     return "(Untitled)"
 
 
+def get_page_author(page: dict) -> str:
+    """Extract author from page with fallback to user API."""
+    author_info = page.get("created_by", {})
+    if not author_info:
+        return "Unknown"
+    
+    # Try to get name directly
+    author = author_info.get("name")
+    if author:
+        return author
+    
+    # Fallback: fetch user by ID
+    user_id = author_info.get("id")
+    if user_id:
+        try:
+            user_data = safe_request(notion.users.retrieve, user_id=user_id)
+            author = user_data.get("name")
+            if author:
+                return author
+        except Exception as e:
+            print(f"  ⚠ Could not fetch user {user_id}: {e}")
+    
+    return "Unknown"
+
+
 def get_children(block_id: str, page_size: int = 100) -> List[dict]:
     """Fetch all immediate children of a block."""
     blocks = []
