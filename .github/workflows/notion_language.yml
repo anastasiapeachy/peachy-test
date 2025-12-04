@@ -2,13 +2,18 @@ name: Notion Language Analysis
 
 on:
   workflow_dispatch:
+    inputs:
+      max_pages:
+        description: 'Maximum number of pages to analyze'
+        required: false
+        default: '500'
   schedule:
     - cron: '0 0 * * 1'  # Weekly on Mondays (optional)
 
 jobs:
   analyze-notion:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     
     steps:
       - name: Checkout repository
@@ -18,21 +23,25 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'  # Cache pip dependencies for faster runs
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install notion-client==2.0.0 langdetect==1.0.9
-          fi
+          pip install -r requirements.txt
 
       - name: Run language analysis
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
+          MAX_PAGES: ${{ github.event.inputs.max_pages || '500' }}
         run: python notion_language_check.py
 
       - name: Upload analysis report
