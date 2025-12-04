@@ -17,7 +17,6 @@ from langdetect import detect, LangDetectException
 # Configuration
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
-MAX_PAGES = int(os.getenv("MAX_PAGES", "1000"))  # Safety limit
 PROGRESS_INTERVAL = 5  # Report progress every N pages
 
 if not NOTION_TOKEN:
