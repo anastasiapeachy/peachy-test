@@ -2,18 +2,13 @@ name: Notion Language Analysis
 
 on:
   workflow_dispatch:
-    inputs:
-      max_pages:
-        description: 'Maximum number of pages to analyze'
-        required: false
-        default: '500'
   schedule:
     - cron: '0 0 * * 1'  # Weekly on Mondays (optional)
 
 jobs:
   analyze-notion:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 360  # 6 hours max
     
     steps:
       - name: Checkout repository
@@ -41,7 +36,6 @@ jobs:
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           ROOT_PAGE_ID: ${{ secrets.ROOT_PAGE_ID }}
-          MAX_PAGES: ${{ github.event.inputs.max_pages || '500' }}
         run: python notion_language_check.py
 
       - name: Upload analysis report
@@ -50,4 +44,4 @@ jobs:
         with:
           name: notion-language-report-${{ github.run_number }}
           path: notion_language_percentages.csv
-          retention-days: 30
+          retention-days: 90
