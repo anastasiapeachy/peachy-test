@@ -1,4 +1,4 @@
-name: Notion Biweekly Pages Report
+name: Notion Biweekly New Pages Report
 on:
   workflow_dispatch:
   schedule:
