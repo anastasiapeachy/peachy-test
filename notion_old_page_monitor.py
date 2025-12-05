@@ -1,7 +1,7 @@
 """
 Notion Old Pages Monitor
 Scans Notion workspace for pages not edited in the past year.
-Generates a CSV report and sends Slack notifications.
+Sends the top 10 oldest pages to Slack.
 """
 from notion_client import Client
 from notion_client.errors import APIResponseError
@@ -9,22 +9,14 @@ import os
 import time
 import requests
 from datetime import datetime, timezone, timedelta
-import csv
-import json
-import argparse
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 # ======================================================
 # CONFIGURATION
 # ======================================================
-parser = argparse.ArgumentParser(description="Monitor old Notion pages")
-parser.add_argument("--artifact-url", default=None, help="URL of the CSV artifact for Slack notification")
-args = parser.parse_args()
-
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 ROOT_PAGE_ID = os.getenv("ROOT_PAGE_ID")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-ARTIFACT_URL = args.artifact_url
 
 # Validate required environment variables
 if not NOTION_TOKEN:
@@ -34,10 +26,6 @@ if not ROOT_PAGE_ID:
 
 notion = Client(auth=NOTION_TOKEN)
 ONE_YEAR_AGO = datetime.now(timezone.utc) - timedelta(days=365)
-
-# File paths
-CSV_FILE = "notion_old_pages.csv"
-COUNT_FILE = "notion_old_pages_count.json"
 
 # ======================================================
 # API REQUEST HANDLER
@@ -226,75 +214,69 @@ def scan_all_pages(block_id: str) -> List[Dict]:
     return pages
 
 # ======================================================
-# CSV GENERATION
-# ======================================================
-def generate_csv_report() -> int:
-    """
-    Scan Notion workspace and generate CSV report of old pages.
-    Returns the count of old pages found.
-    """
-    print("Starting Notion workspace scan...")
-    print(f"Looking for pages not edited since {ONE_YEAR_AGO.strftime('%Y-%m-%d')}")
-    
-    all_pages = scan_all_pages(ROOT_PAGE_ID)
-    print(f"Total pages discovered: {len(all_pages)}")
-
-    # Filter pages older than one year
-    old_pages = [
-        {
-            "title": page["title"],
-            "last_edited": page["last_edited"].isoformat(),
-            "url": page["url"],
-        }
-        for page in all_pages
-        if page["last_edited"] < ONE_YEAR_AGO
-    ]
-
-    # Sort by last edited date (oldest first)
-    old_pages.sort(key=lambda x: x["last_edited"])
-    
-    old_page_count = len(old_pages)
-    print(f"Pages not edited in over a year: {old_page_count}")
-
-    # Write CSV report
-    with open(CSV_FILE, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["title", "last_edited", "url"])
-        for page in old_pages:
-            writer.writerow([page["title"], page["last_edited"], page["url"]])
-
-    print(f"CSV report saved to {CSV_FILE}")
-
-    # Save count for Phase 2
-    with open(COUNT_FILE, "w", encoding="utf-8") as f:
-        json.dump({"count": old_page_count}, f)
-
-    return old_page_count
-
-# ======================================================
 # SLACK NOTIFICATION
 # ======================================================
-def send_slack_notification(page_count: int, artifact_url: str) -> None:
+def send_slack_notification(old_pages: List[Dict], total_old_count: int) -> None:
     """
-    Send Slack webhook notification with report summary.
+    Send Slack notification with top 10 oldest pages.
     """
     if not SLACK_WEBHOOK_URL:
-        print("SLACK_WEBHOOK_URL not configured. Skipping notification.")
+        print("SLACK_WEBHOOK_URL not configured. Skipping Slack notification.")
         return
 
-    if page_count == 0:
+    if not old_pages:
         print("No old pages found. Skipping Slack notification.")
         return
 
-    message = (
-        f"📄 Found *{page_count}* pages in Notion that haven't been edited for over a year.\n"
-        f"📎 Full report: {artifact_url}"
-    )
+    # Format the top 10 pages
+    pages_text = []
+    for i, page in enumerate(old_pages[:10], 1):
+        title = page["title"]
+        url = page["url"]
+        days_ago = (datetime.now(timezone.utc) - page["last_edited"]).days
+        pages_text.append(f"{i}. <{url}|{title}> - _{days_ago} days ago_")
+
+    pages_list = "\n".join(pages_text)
+    
+    # Add note if there are more pages
+    more_text = ""
+    if total_old_count > 10:
+        more_text = f"\n\n_...and {total_old_count - 10} more pages not edited in over a year_"
+
+    message = {
+        "text": f"📄 Notion Old Pages Report - {total_old_count} pages found",
+        "blocks": [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "📄 Notion Old Pages Report"
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"Found *{total_old_count}* pages that haven't been edited for over a year.\n\n*Top 10 oldest pages:*"
+                }
+            },
+            {
+                "type": "divider"
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": pages_list + more_text
+                }
+            }
+        ]
+    }
 
     try:
         response = requests.post(
             SLACK_WEBHOOK_URL,
-            json={"text": message},
+            json=message,
             timeout=10
         )
         
@@ -305,44 +287,33 @@ def send_slack_notification(page_count: int, artifact_url: str) -> None:
     except Exception as e:
         print(f"Error sending Slack notification: {e}")
 
-def notify_slack_from_saved_count() -> None:
-    """
-    Read saved count and send Slack notification (Phase 2).
-    """
-    try:
-        with open(COUNT_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            page_count = data["count"]
-    except FileNotFoundError:
-        print(f"Count file {COUNT_FILE} not found. Skipping Slack notification.")
-        return
-    except (KeyError, json.JSONDecodeError) as e:
-        print(f"Error reading count file: {e}")
-        return
-
-    if not ARTIFACT_URL:
-        print("No artifact URL provided. Cannot send Slack notification.")
-        return
-
-    send_slack_notification(page_count, ARTIFACT_URL)
-
 # ======================================================
 # MAIN EXECUTION
 # ======================================================
 def main():
     """
-    Main execution flow.
-    Phase 1: Scan and generate CSV (when --artifact-url is not provided)
-    Phase 2: Send Slack notification (when --artifact-url is provided)
+    Scan Notion workspace and send Slack notification with top 10 oldest pages.
     """
-    if ARTIFACT_URL:
-        # Phase 2: Slack notification
-        print("Running Phase 2: Sending Slack notification...")
-        notify_slack_from_saved_count()
-    else:
-        # Phase 1: Scan and generate report
-        print("Running Phase 1: Scanning Notion and generating report...")
-        generate_csv_report()
+    print("Starting Notion workspace scan...")
+    print(f"Looking for pages not edited since {ONE_YEAR_AGO.strftime('%Y-%m-%d')}")
+    
+    all_pages = scan_all_pages(ROOT_PAGE_ID)
+    print(f"Total pages discovered: {len(all_pages)}")
+
+    # Filter pages older than one year
+    old_pages = [
+        page for page in all_pages
+        if page["last_edited"] < ONE_YEAR_AGO
+    ]
+
+    # Sort by last edited date (oldest first)
+    old_pages.sort(key=lambda x: x["last_edited"])
+    
+    total_old_count = len(old_pages)
+    print(f"Pages not edited in over a year: {total_old_count}")
+
+    # Send Slack notification
+    send_slack_notification(old_pages, total_old_count)
 
 if __name__ == "__main__":
     main()
