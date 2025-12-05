@@ -248,11 +248,10 @@ def main():
             print("No pages found created between 7 and 21 days ago.")
             return
 
-        msg = ["🆕 *New pages created in Notion:*", ""]
+        msg = ["*New pages created in Notion:*", ""]
         for p in filtered_pages:
             msg.append(
-                f"📘 *{p['title']}*\n"
-                f"🔗 {p['url']}\n"
+                f"📘 <{p['url']}|*{p['title']}*>\n"
                 f"✍️ {p['author']}\n"
             )
 
